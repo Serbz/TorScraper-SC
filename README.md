@@ -1,5 +1,7 @@
 # Tor Scraper Application
 
+********** YOU MUST DOWNLOAD TOR AND PUT IT IN A FOLDER CALLED TOR IN THE SCRIPT DIRECTORY **********
+
 A powerful, multi-threaded web scraping tool with a graphical user interface (GUI) built using PySide6. This application uses **Tor** for network anonymity and features real-time **network activity monitoring** powered by Scapy and Npcap.
 
 ---
