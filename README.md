@@ -4,7 +4,7 @@
 
 ******************* YOU MUST DOWNLOAD TOR AND PUT IT IN A FOLDER CALLED TOR IN THE SCRIPT DIRECTORY ********************
 
-*** https://archive.torproject.org/tor-package-archive/torbrowser/15.0/tor-expert-bundle-windows-x86_64-15.0.tar.gz ****
+******* https://archive.torproject.org/tor-package-archive/torbrowser/15.0/tor-expert-bundle-windows-x86_64-15.0.tar.gz *******
 
 ************************************************************************************************************************
 
