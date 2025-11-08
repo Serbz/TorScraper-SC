@@ -1,9 +1,13 @@
 # Tor Scraper Application
 
 *********************************************************************************************************************************************
+
 ****************************** YOU MUST DOWNLOAD TOR AND PUT IT IN A FOLDER CALLED TOR IN THE SCRIPT DIRECTORY ******************************
+
 ************** https://archive.torproject.org/tor-package-archive/torbrowser/15.0/tor-expert-bundle-windows-x86_64-15.0.tar.gz **************
+
 *********************************************************************************************************************************************
+
 
 
 A powerful, multi-threaded web scraping tool with a graphical user interface (GUI) built using PySide6. This application uses **Tor** for network anonymity and features real-time **network activity monitoring** powered by Scapy and Npcap.
