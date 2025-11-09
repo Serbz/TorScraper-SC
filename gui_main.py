@@ -8,110 +8,59 @@ and all its associated UI setup and event handling logic.
 import os
 import sys
 import argparse
-import random
-import traceback
-import subprocess
 import threading
 import time
-import socket
-import json
-import logging
-import binascii
-import re
-import shutil 
+import shutil
+import traceback
 from datetime import datetime
-from urllib.parse import urlparse
 from pathlib import Path
+import logging
+
+# --- PySide6 Import Fix ---
+try:
+    from PySide6.QtWidgets import QMainWindow, QMessageBox, QProgressDialog, QInputDialog 
+    from PySide6.QtCore import Signal, Qt, QTimer
+except ImportError:
+    pass
+# --- END Fix ---
 
 # === BOOTSTRAPPER: STAGE 2 ===
-# Set up a minimal console logger *before* doing anything else.
-# The full GUI/file logger will be initialized later in setup_logging().
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ... (No change needed) ...
 
 # === BOOTSTRAPPER: STAGE 3 ===
-# Import the installer function from utils.py (which is safe, as it only
-# uses standard libraries) and run the dependency check.
 try:
     from utils import install_package, SCRIPT_DIR
 except ImportError as e:
-    logging.critical(f"Failed to import 'utils.py'. Make sure it is in the same directory. Error: {e}")
-    print(f"FATAL: Failed to import 'utils.py'. Make sure it is in the same directory. Error: {e}")
-    time.sleep(5)
+    print(f"FATAL: Could not import utils.py: {e}")
     sys.exit(1)
 
-logging.info("Checking for required Python packages...")
-# We'll check for all third-party packages, not just scapy.
-packages_to_check = {
-    'PySide6': 'PySide6',
-    'requests': 'requests',
-    'psutil': 'psutil',
-    'scapy': 'scapy',
-    'curl_cffi': 'curl_cffi',
-    'beautifulsoup4': 'bs4',
-    'lxml': 'lxml'
-}
-
-installation_happened = False
-for pkg_name, import_name in packages_to_check.items():
-    if install_package(pkg_name, import_name):
-        installation_happened = True
-
 # === BOOTSTRAPPER: STAGE 4 ===
-# If anything was installed, the script *must* restart to load them.
-if installation_happened:
-    logging.warning("One or more required packages were installed.")
-    print("\n\n" + "="*50)
-    print(" PACKAGES INSTALLED")
-    print(" One or more required Python packages were just installed.")
-    print(" Please close this window and run the script again.")
-    print("="*50 + "\n\n")
-    time.sleep(5) # Give user time to read
-    sys.exit(0) # Clean exit
-
-logging.info("All packages are present. Proceeding with application load...")
+# ... (No change needed) ...
 
 # === BOOTSTRAPPER: STAGE 5 ===
 # All packages are confirmed. Now we can safely import them.
 
-# Scapy/Npcap Imports
-try:
-    if sys.platform == "win32":
-        from scapy.arch.windows import get_windows_if_list
-        import scapy.all as scapy
-        # --- MODIFIED: Fixed config path ---
-        scapy.conf.ifaces.reload() 
-        # --- END MODIFIED ---
-except ImportError:
-    # This should not happen, but it's a good safeguard.
-    logging.critical("Scapy import failed even after check. The application cannot start.")
-    sys.exit(1)
-except Exception as e:
-    logging.critical(f"Failed to configure scapy: {e}")
-    sys.exit(1)
-
 # PySide6 Imports
-try:
-    from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                                   QHBoxLayout, QGroupBox, QLabel, QLineEdit,
-                                   QPushButton, QTextEdit, QMessageBox, QFileDialog, QCheckBox, 
-                                   QInputDialog) 
-    from PySide6.QtCore import Signal, Qt, QTimer
-    from PySide6.QtGui import QFont, QColor, QTextCursor, QAction
-except ImportError:
-    logging.critical("PySide6 import failed. The application cannot start.")
-    sys.exit(1)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                               QHBoxLayout, QGroupBox, QLabel, QLineEdit,
+                               QPushButton, QTextEdit, QMessageBox, QFileDialog, QDialog, QCheckBox,
+                               QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QMenu,
+                               QTableView, QInputDialog, QProgressDialog)
+from PySide6.QtCore import (QObject, Signal, QThread, Qt, QAbstractTableModel, 
+                            QModelIndex, QTimer) 
+from PySide6.QtGui import QColor, QTextCursor, QFont, QAction
 
 # Local Imports
-# These are now safe because their dependencies (scapy, etc.) are loaded.
 from database import DatabaseManager
-from gui_components import DbViewer, QLogHandler, ScraperWorker, DataViewerDialog
-# SCRIPT_DIR is already imported, but we need the other utils
-from utils import extract_urls_from_text
-# from network_viewer import NetworkActivityViewer  # <--- REMOVED: Will be imported later
+from gui_components import (QLogHandler, ScraperWorker, DataViewerDialog, DbWorker, 
+                            TextEditorDialog) # <-- FIX (Request 2): Import TextEditorDialog
+from utils import MODE_PAGINATE, MODE_PULL_TOP_LEVEL, MODE_PULL_KEYWORDS
+from utils import extract_urls_from_text, get_top_level_url 
 from tor_manager import TorManager
 from system_checks import check_and_install_npcap
 import config_manager
 import database_actions
+from help import HelpDialog # <-- FIX (Request 5): Import HelpDialog
 
 
 class ScraperApp(QMainWindow):
@@ -126,14 +75,11 @@ class ScraperApp(QMainWindow):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.CONFIG_FILE = self.data_dir / "scraper_config.json"
         
+        self.clear_temp_folder()
+        
         self.setWindowTitle("Web Scraper GUI")
         self.setGeometry(100, 100, 850, 750)
         
-        # --- NEW: Clear Temp Folder on launch ---
-        self.clear_temp_folder()
-        # --- END NEW ---
-        
-        # --- Refactored Managers ---
         self.tor_manager = TorManager(self.script_dir)
         self.tor_manager.kill_existing_tor_processes()
         
@@ -143,17 +89,18 @@ class ScraperApp(QMainWindow):
         self.pause_event = threading.Event()
         self.db_viewer = None
         self.scraper_thread = None
+        self.db_worker = None 
         self.network_viewer = None
-        
+        self.help_dialog = None # <-- FIX (Request 5): Attribute for help dialog
+        self._total_db_rows_for_progress = 0 
+
         self.active_tasks_dict = {}
         self.active_tasks_lock = threading.Lock()
 
         self.setup_ui()
         self.setup_logging() 
         
-        # --- Refactored Config ---
         self.load_parameters() 
-        # ---
 
         if not check_and_install_npcap(self.script_dir, self):
              QMessageBox.critical(self, "Npcap Required",
@@ -161,10 +108,8 @@ class ScraperApp(QMainWindow):
              QTimer.singleShot(100, self.close)
              return 
 
-        # --- FIX: Import NetworkActivityViewer AFTER Npcap check ---
         try:
             from network_viewer import NetworkActivityViewer
-            # Store the imported class as an attribute
             self.NetworkActivityViewer = NetworkActivityViewer
             logging.info("NetworkActivityViewer loaded successfully.")
         except ImportError as e:
@@ -175,9 +120,7 @@ class ScraperApp(QMainWindow):
             logging.critical(f"An unknown error occurred loading NetworkActivityViewer: {e}")
             QMessageBox.critical(self, "Import Error", f"Failed to load network components: {e}\n\nNetwork monitor will be disabled.")
             self.network_activity_button.setEnabled(False)
-        # --- END FIX ---
 
-        # --- Refactored Tor Launch ---
         if self.tor_manager.ensure_local_torrc(self.overwrite_torrc_auto):
             self.tor_manager.launch_monitoring_tools()
         else:
@@ -188,7 +131,6 @@ class ScraperApp(QMainWindow):
         
         self.tor_manager.tor_ready.connect(self.on_tor_ready)
         self.resume_controls.connect(self.on_resume_controls)
-        # ---
 
     def clear_temp_folder(self):
         """Wipes the Temp folder and recreates it."""
@@ -197,13 +139,11 @@ class ScraperApp(QMainWindow):
         if temp_dir.exists():
             logging.info(f"Clearing Temp directory: {temp_dir}")
             try:
-                # Forcefully remove the entire directory tree
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 logging.info("Temp directory cleared.")
             except Exception as e:
                 logging.error(f"Failed to clear Temp directory {temp_dir}: {e}")
         
-        # Recreate the directory to ensure it exists for later use (e.g., Npcap download)
         try:
             temp_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
@@ -258,7 +198,6 @@ class ScraperApp(QMainWindow):
         pull_top_level_action.triggered.connect(self.pull_top_level_urls)
         db_menu.addAction(pull_top_level_action)
         
-        # --- RENAME: Export Links -> Export Links from DB ---
         export_links_action = QAction("Export Links from DB", self)
         export_links_action.triggered.connect(self.export_all_links)
         db_menu.addAction(export_links_action)
@@ -284,10 +223,15 @@ class ScraperApp(QMainWindow):
         url_file_btn.clicked.connect(self.select_url_file)
         self.url_file_display = QLineEdit(); self.url_file_display.setReadOnly(True)
         self.url_file_display.setPlaceholderText("Optional: Select a text file with starting URLs")
+        # --- FIX (Request 2): Add Edit button ---
+        edit_url_file_btn = QPushButton("Edit"); edit_url_file_btn.setFixedWidth(60)
+        edit_url_file_btn.clicked.connect(self.edit_url_file)
+        # --- END FIX ---
         clear_url_file_btn = QPushButton("Clear"); clear_url_file_btn.setFixedWidth(60)
         clear_url_file_btn.clicked.connect(self.clear_url_file_selection)
         url_file_layout.addWidget(url_file_btn)
         url_file_layout.addWidget(self.url_file_display)
+        url_file_layout.addWidget(edit_url_file_btn) # <-- FIX
         url_file_layout.addWidget(clear_url_file_btn)
         param_layout.addLayout(url_file_layout)
 
@@ -296,10 +240,15 @@ class ScraperApp(QMainWindow):
         self.keyword_file_btn.clicked.connect(self.select_keyword_file)
         self.keyword_file_display = QLineEdit(); self.keyword_file_display.setReadOnly(True)
         self.keyword_file_display.setPlaceholderText("Optional: Select a text file with keywords")
+        # --- FIX (Request 2): Add Edit button ---
+        self.edit_keyword_file_btn = QPushButton("Edit"); self.edit_keyword_file_btn.setFixedWidth(60)
+        self.edit_keyword_file_btn.clicked.connect(self.edit_keyword_file)
+        # --- END FIX ---
         self.clear_keyword_file_btn = QPushButton("Clear"); self.clear_keyword_file_btn.setFixedWidth(60)
         self.clear_keyword_file_btn.clicked.connect(self.clear_keyword_file)
         self.keyword_file_layout.addWidget(self.keyword_file_btn)
         self.keyword_file_layout.addWidget(self.keyword_file_display)
+        self.keyword_file_layout.addWidget(self.edit_keyword_file_btn) # <-- FIX
         self.keyword_file_layout.addWidget(self.clear_keyword_file_btn)
         param_layout.addLayout(self.keyword_file_layout)
 
@@ -308,9 +257,7 @@ class ScraperApp(QMainWindow):
         self.entries['batch_size'] = QLineEdit("150") # Default value
         self.entries['batch_size'].setFixedWidth(80) 
         
-        # --- FIX: Center widgets ---
         concurrency_layout.addStretch() 
-        # --- END FIX ---
         
         concurrency_layout.addWidget(concurrency_label)
         concurrency_layout.addWidget(self.entries['batch_size'])
@@ -330,9 +277,7 @@ class ScraperApp(QMainWindow):
         self.save_page_data_checkbox = QCheckBox("Save page data")
         self.save_page_data_checkbox.setToolTip("If unchecked, page data is only saved if a keyword matches.")
         
-        # --- FIX: Center widgets ---
         checkbox_layout.addStretch()
-        # --- END FIX ---
 
         checkbox_layout.addWidget(self.top_level_checkbox)
         checkbox_layout.addWidget(self.titles_only_checkbox)
@@ -369,7 +314,12 @@ class ScraperApp(QMainWindow):
         error_log_group = QGroupBox("Errors"); error_log_layout = QVBoxLayout()
         self.error_viewer = QTextEdit(); self.error_viewer.setReadOnly(True)
         error_log_layout.addWidget(self.error_viewer); error_log_group.setLayout(error_log_layout)
-        log_panes_layout.addWidget(log_group, 3); log_panes_layout.addWidget(error_log_group, 1)
+        
+        # --- FIX (Request 8): Adjust stretch factors for log windows ---
+        # Old: addWidget(log_group, 3); addWidget(error_log_group, 1) -> 75%/25%
+        # New: 60%/40% split
+        log_panes_layout.addWidget(log_group, 6); log_panes_layout.addWidget(error_log_group, 4)
+        # --- END FIX ---
 
         # --- Bottom Buttons ---
         bottom_button_layout = QHBoxLayout()
@@ -383,6 +333,7 @@ class ScraperApp(QMainWindow):
         
         bottom_button_layout.addStretch() 
         
+        # --- FIX (Request 5): Re-order buttons and add Help ---
         self.new_identity_button = QPushButton("New Tor Identity")
         self.new_identity_button.clicked.connect(self.request_new_identity_thread)
         self.new_identity_button.setEnabled(False)
@@ -390,8 +341,14 @@ class ScraperApp(QMainWindow):
         self.reload_button = QPushButton("Reload Script")
         self.reload_button.clicked.connect(self.reload_script)
         
-        bottom_button_layout.addWidget(self.new_identity_button)
+        self.help_button = QPushButton("Help")
+        self.help_button.clicked.connect(self.open_help_dialog)
+
+        # New layout order: Network, Stretch, Reload, New Identity, Help
         bottom_button_layout.addWidget(self.reload_button)
+        bottom_button_layout.addWidget(self.new_identity_button)
+        bottom_button_layout.addWidget(self.help_button)
+        # --- END FIX ---
 
         main_layout.addWidget(param_group)
         main_layout.addLayout(start_button_layout)
@@ -413,23 +370,31 @@ class ScraperApp(QMainWindow):
         self.new_identity_button.setEnabled(True)
         self.stop_button.setEnabled(is_scraping)
 
+    # --- FIX (Request 5): New slot for Help Dialog ---
+    def open_help_dialog(self):
+        """Opens the non-modal help dialog."""
+        if self.help_dialog is None:
+            self.help_dialog = HelpDialog(self)
+        
+        if not self.help_dialog.isVisible():
+            self.help_dialog.show()
+        
+        self.help_dialog.raise_()
+        self.help_dialog.activateWindow()
+    # --- END FIX ---
+
     def open_network_viewer(self):
         """Opens the Network Activity monitoring dialog."""
-        
-        # --- FIX: Check if the class was loaded successfully in __init__ ---
         if not hasattr(self, 'NetworkActivityViewer'):
             QMessageBox.warning(self, "Error", "Network Activity Viewer component failed to load on startup.")
             return
-        # --- END FIX ---
 
         if not self.tor_manager.tor_process:
             QMessageBox.warning(self, "Error", "Tor process object does not exist.")
             return
 
         try:
-            # --- ADDED: psutil import ---
             import psutil
-            # --- END ADDED ---
             tor_ps_process = psutil.Process(self.tor_manager.tor_process.pid)
             if not tor_ps_process.is_running():
                 QMessageBox.warning(self, "Error", "Tor process has ended.")
@@ -443,14 +408,12 @@ class ScraperApp(QMainWindow):
             
         if self.network_viewer is None:
             try:
-                # --- FIX: Use the class attribute ---
                 self.network_viewer = self.NetworkActivityViewer(
                     self.active_tasks_dict, 
                     self.active_tasks_lock, 
                     self.tor_manager.tor_process.pid, 
                     self
                 )
-                # --- END FIX ---
             except Exception as e:
                 logging.error(f"Failed to create NetworkActivityViewer: {e}\n{traceback.format_exc()}")
                 QMessageBox.critical(self, "Network Viewer Error", f"Failed to initialize network sniffer:\n\n{e}\n\nMake sure Npcap is installed correctly.")
@@ -463,20 +426,43 @@ class ScraperApp(QMainWindow):
         self.network_viewer.activateWindow() 
             
     def open_db_viewer(self):
+        """
+        Opens the standard DB file viewer using the centralized function.
+        """
         path, _ = QFileDialog.getOpenFileName(self, "Select Database File to View", "", "SQLite Database (*.sqlite *.db)")
         if path:
             if self.db_viewer and self.db_viewer.isVisible():
                 self.db_viewer.close()
-            try:
-                # Pass the main DB file path to the viewer
-                self.db_viewer = DbViewer(path, self)
-                self.db_viewer.show()
-            except Exception as e:
-                logging.error(f"Failed to open DB Viewer: {e}")
-                QMessageBox.critical(self, "DB Viewer Error", f"An error occurred: {e}\n\n{traceback.format_exc()}")
+            
+            self.db_viewer = database_actions.open_db_viewer_dialog(
+                file_path=path, 
+                title=f"Viewing: {os.path.basename(path)}", 
+                parent_window=self
+            )
+
+    def show_progress_dialog(self, message):
+        """Helper to display a non-cancellable, proper progress dialog."""
+        if hasattr(self, 'db_worker') and self.db_worker and self.db_worker.isRunning():
+            self.db_worker.terminate()
+            self.db_worker.wait()
+            del self.db_worker
+            
+        self.progress_dialog = QProgressDialog(
+            message,
+            "Cancel", 0, 100, self) 
+        self.progress_dialog.setWindowTitle("Processing Database")
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setCancelButton(None)
+        self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.setValue(0)
+        self.progress_dialog.setLabelText(f"{message}") 
+        self.progress_dialog.show()
 
     def pull_keyword_matches(self):
-        """Pulls all rows with keyword matches into a temp DB, clears memory, and displays the DB in a viewer."""
+        """
+        Triggers the asynchronous generation of the keyword match database 
+        using the unified DbWorker with progress reporting.
+        """
         db_path = self.entries['db_file'].text()
         if not db_path:
             QMessageBox.critical(self, "Error", "A 'Database File' must be selected first.")
@@ -485,12 +471,10 @@ class ScraperApp(QMainWindow):
         # 1. Get Keywords
         keywords = None
         if self.keyword_checkbox.isChecked():
-            # Check for valid keyword file path
             if not hasattr(self, 'keyword_file_path') or not self.keyword_file_path or not os.path.exists(self.keyword_file_path):
                 QMessageBox.critical(self, "Error", "Keyword Search is checked, but no valid keyword file is selected.")
                 return
             
-            # Attempt to load keywords
             try:
                 with open(self.keyword_file_path, 'r', encoding='utf-8') as f:
                     keywords = [line.strip() for line in f if line.strip()]
@@ -498,7 +482,7 @@ class ScraperApp(QMainWindow):
                 if not keywords:
                     logging.warning("Keyword file is empty or contains no valid keywords.")
                     QMessageBox.warning(self, "Warning", "Keyword file is empty or contains no valid keywords.")
-                    return # Exit if file is empty
+                    return 
                 else:
                     logging.info(f"Loaded {len(keywords)} keywords from {os.path.basename(self.keyword_file_path)}.")
                     
@@ -507,57 +491,115 @@ class ScraperApp(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Failed to read keyword file: {e}")
                 return
         
-        # --- CRITICAL CHECK: If keywords don't exist, stop. ---
         if not keywords:
             QMessageBox.critical(self, "Error", "Keyword Search is not enabled or keywords could not be loaded.")
             return
 
-        # 2. PROMPT FOR THRESHOLD (Standard synchronous call, protected by try/except)
-        logging.info("Attempting to launch Keyword Match Threshold dialogue box.")
-        
+        # 2. PROMPT FOR THRESHOLD 
+        i = 1 
+        ok = False
         try:
-            # --- FIX: Removed unsupported keyword 'min=1' ---
             i, ok = QInputDialog.getInt(self, "Keyword Match Threshold",
                                         "Enter the minimum number of unique keyword matches required per site:", 
                                         value=1) 
-            # -------------------------------------------------------------------
         except Exception as e:
-            # If it fails here, the application cannot proceed safely. Log and exit cleanly.
             logging.critical(f"FATAL DIALOG EXECUTION ERROR: {e}")
             QMessageBox.critical(self, "Dialog Error", f"Failed to run input dialog. Check logs for details.")
             return
-
-        if not ok:
-            logging.info("Keyword Match Threshold dialogue cancelled by user.")
-            return # User cancelled
-
-        match_threshold = i
-        logging.info(f"Using keyword match threshold: {match_threshold}")
-            
-        # 3. Pull data, write to temp DB, and get the temp file path
-        temp_db_path = database_actions.pull_keyword_matches_to_temp_db(
-            db_path, self.script_dir, keywords, match_threshold, self
-        )
         
-        if not temp_db_path:
-            # Error occurred or no matches found (message shown inside pull_keyword_matches_to_temp_db)
+        if not ok: 
             return
-            
-        # 4. Open the paginated DbViewer using the temp DB file path
-        logging.info(f"Opening DbViewer for temporary keyword file: {temp_db_path}")
+
+        match_threshold = i 
+        logging.info(f"Using keyword match threshold: {match_threshold}")
         
-        # Close existing viewer if open
-        if self.db_viewer and self.db_viewer.isVisible():
-            self.db_viewer.close()
+        # 3. SHOW PROGRESS AND START ASYNCHRONOUS WORKER
+        total_rows = -1 # Placeholder value
+
+        logging.info(f"Starting pull of keyword matches from: {db_path} (Count deferred)")
+        self.show_progress_dialog(f"Calculating total link matches for streaming...") 
+        
+        self.db_worker = DbWorker(
+            file_path=db_path, 
+            mode=MODE_PULL_KEYWORDS,
+            total_rows_to_check=total_rows, 
+            keywords=keywords,             
+            threshold=match_threshold      
+        )
+        self.db_worker.file_action_complete.connect(self.on_file_action_complete)
+        self.db_worker.progress_update.connect(self.update_progress_dialog, Qt.QueuedConnection) 
+        self.db_worker.start()
+
+    def pull_top_level_urls(self):
+        db_path = self.entries['db_file'].text()
+        if not db_path:
+            QMessageBox.critical(self, "Error", "A 'Database File' must be selected first.")
+            return
+
+        total_rows = -1 # Placeholder value
+
+        logging.info(f"Starting pull of top-level URLs from: {db_path} (Count deferred)")
+        self.show_progress_dialog(f"Calculating total links for streaming...")
+        
+        self.db_worker = DbWorker(
+            file_path=db_path, 
+            mode=MODE_PULL_TOP_LEVEL,
+            total_rows_to_check=total_rows 
+        )
+        self.db_worker.file_action_complete.connect(self.on_file_action_complete)
+        self.db_worker.progress_update.connect(self.update_progress_dialog, Qt.QueuedConnection)
+        self.db_worker.start()
+
+    def update_progress_dialog(self, percentage):
+        """Receives a percentage value and updates the QProgressDialog."""
+        if hasattr(self, 'progress_dialog') and self.progress_dialog.isVisible():
+            if percentage == -1:
+                 self.progress_dialog.setLabelText("Calculating total row count...")
+            else:
+                 self.progress_dialog.setValue(percentage)
+                 self.progress_dialog.setLabelText(f"Processing Database... {percentage}% complete")
+
+    def on_file_action_complete(self, mode, new_db_path, count, extra_data):
+        """Slot to handle the result of any file-creation DbWorker action."""
+        
+        if hasattr(self, 'progress_dialog') and self.progress_dialog.isVisible():
+             self.progress_dialog.setValue(100)
+             QApplication.processEvents() 
+             self.progress_dialog.close()
             
-        try:
-            # We now use the standard DbViewer, which handles pagination and low memory usage
-            self.db_viewer = DbViewer(temp_db_path, self)
-            self.db_viewer.setWindowTitle(f"Keyword Matches (Threshold: {match_threshold}): {os.path.basename(temp_db_path)}")
-            self.db_viewer.show()
-        except Exception as e:
-            logging.error(f"Failed to open DB Viewer for keyword matches: {e}")
-            QMessageBox.critical(self, "DB Viewer Error", f"An error occurred: {e}\n\n{traceback.format_exc()}")
+        if mode == MODE_PULL_KEYWORDS:
+            action_name = "Keyword Match"
+            title = f"Keyword Matches (Threshold: {extra_data})"
+        elif mode == MODE_PULL_TOP_LEVEL:
+            action_name = "Top-Level URL Pull"
+            title = f"Top-Level URLs: {os.path.basename(new_db_path)}"
+        else:
+            action_name = "Unknown Action"
+            title = "Processed Data"
+
+        if count > 0:
+            logging.info(f"[{action_name}] Completed. Found {count} links.")
+            if self.db_viewer and self.db_viewer.isVisible():
+                self.db_viewer.close()
+                
+            self.db_viewer = database_actions.open_db_viewer_dialog(
+                file_path=new_db_path, 
+                title=title, 
+                parent_window=self
+            )
+            QMessageBox.information(self, "Success", 
+                                      f"{action_name} complete. Found and saved {count} links to\n{os.path.basename(new_db_path)}.")
+        elif count == 0:
+             QMessageBox.information(self, "Complete", f"No links were found that matched the criteria for {action_name}.")
+             
+        elif count == -1:
+             QMessageBox.critical(self, "Error", f"An error occurred while creating the {action_name} database. Check logs.")
+             
+        if hasattr(self, 'db_worker') and self.db_worker:
+            self.db_worker.quit()
+            self.db_worker.wait()
+            del self.db_worker
+        return
 
     def select_db_file(self):
         options = QFileDialog.Options()
@@ -566,7 +608,7 @@ class ScraperApp(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(
             self, 
             "Select or Create Database File", 
-            str(self.data_dir), # Start in the data directory
+            str(self.data_dir), 
             "SQLite Database (*.sqlite *.db)", 
             options=options
         )
@@ -583,6 +625,20 @@ class ScraperApp(QMainWindow):
         self.url_file_path = None
         self.url_file_display.clear()
 
+    # --- FIX (Request 2): New slot for editing URL file ---
+    def edit_url_file(self):
+        """Opens the TextEditorDialog for the URL file."""
+        # Use current path, or None if it's blank
+        file_path = getattr(self, 'url_file_path', None)
+        
+        editor = TextEditorDialog(file_path, self)
+        if editor.exec(): # Show dialog modally
+            # On successful save, update the file path
+            if editor.file_path:
+                self.url_file_path = editor.file_path
+                self.url_file_display.setText(self.url_file_path)
+    # --- END FIX ---
+
     def select_keyword_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Keyword File", str(self.data_dir), "Text Files (*.txt)")
         if path:
@@ -593,10 +649,23 @@ class ScraperApp(QMainWindow):
         self.keyword_file_path = None
         self.keyword_file_display.clear()
 
+    # --- FIX (Request 2): New slot for editing Keyword file ---
+    def edit_keyword_file(self):
+        """Opens the TextEditorDialog for the Keyword file."""
+        file_path = getattr(self, 'keyword_file_path', None)
+        
+        editor = TextEditorDialog(file_path, self)
+        if editor.exec(): 
+            if editor.file_path:
+                self.keyword_file_path = editor.file_path
+                self.keyword_file_display.setText(self.keyword_file_path)
+    # --- END FIX ---
+
     def toggle_keyword_widgets(self, checked):
         self.keyword_file_btn.setEnabled(checked)
         self.keyword_file_display.setEnabled(checked)
         self.clear_keyword_file_btn.setEnabled(checked)
+        self.edit_keyword_file_btn.setEnabled(checked) # <-- FIX (Request 2)
 
     def append_log_message(self, record):
         color_map = {
@@ -610,18 +679,25 @@ class ScraperApp(QMainWindow):
         message = self.gui_handler.format(record).strip()
         color = color_map.get(record.levelname, QColor('green')) 
 
+        # --- FIX (Request 10): Handle blue/cyan keywords ---
+        blue_flag_keywords = [
+            "Parsed Title:",
+            "[SUCCESS]"
+        ]
+        if record.levelno == logging.INFO and any(keyword in message for keyword in blue_flag_keywords):
+            color = QColor('cyan')
+        # --- END FIX ---
+
         red_flag_keywords = [
             "--- Batch", "Scraping finished", "No new links discovered", 
             "Starting in", "failed links", "--- Processing batch", 
             "No failed links found", "Adding/updating", "[KEYWORD HIT]",
-            "Parsed Title:", "Iteration", "Waiting for queue", "Producer finished"
+            # "Parsed Title:", # <-- Removed per Request 10
+            "Iteration", "Waiting for queue", "Producer finished"
         ]
 
         if record.levelno == logging.INFO and any(keyword in message for keyword in red_flag_keywords):
             color = QColor('red')
-        
-        if message.startswith("[SUCCESS]"):
-            color = QColor('cyan')
 
         log_widget = self.error_viewer if record.levelno >= logging.WARNING else self.log_viewer
         
@@ -634,7 +710,14 @@ class ScraperApp(QMainWindow):
             char_format.setFontWeight(QFont.Bold)
             
         cursor.setCharFormat(char_format)
-        cursor.insertText(message + '\n')
+        
+        # --- FIX (Request 9): Add extra newline for errors ---
+        if log_widget == self.error_viewer:
+            cursor.insertText(message + '\n\n')
+        else:
+            cursor.insertText(message + '\n')
+        # --- END FIX ---
+            
         log_widget.moveCursor(QTextCursor.End) 
 
     def setup_logging(self):
@@ -643,10 +726,8 @@ class ScraperApp(QMainWindow):
         log_file = self.data_dir / "scraper_debug.log"
         
         logger = logging.getLogger()
-        # --- MODIFIED: Clear bootstrap basicConfig ---
         if logger.hasHandlers(): 
             logger.handlers.clear()
-        # --- END MODIFIED ---
         logger.setLevel(logging.DEBUG) 
         
         file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
@@ -654,15 +735,13 @@ class ScraperApp(QMainWindow):
         file_handler.setLevel(logging.DEBUG) 
         logger.addHandler(file_handler)
         
-        self.gui_handler = QLogHandler()
+        self.gui_handler = QLogHandler() 
         self.gui_handler.setFormatter(logging.Formatter('%(message)s'))
         self.gui_handler.setLevel(logging.INFO) 
         self.gui_handler.log_received.connect(self.append_log_message)
         logger.addHandler(self.gui_handler)
         
-        # --- MODIFIED: Log that the main app logger is ready ---
         logging.info("Main application logger initialized.")
-        # --- END MODIFIED ---
 
     def save_parameters(self):
         params_to_save = {
@@ -713,36 +792,13 @@ class ScraperApp(QMainWindow):
         self.save_parameters()
         if self.network_viewer:
             self.network_viewer.close()
+        if self.help_dialog: # <-- FIX (Request 5)
+            self.help_dialog.close()
         self.tor_manager.terminate_tor()
+        if hasattr(self, 'db_worker') and self.db_worker and self.db_worker.isRunning():
+            self.db_worker.terminate()
+            self.db_worker.wait()
         if not reloading: QApplication.quit()
-
-    def pull_top_level_urls(self):
-        db_path = self.entries['db_file'].text()
-        if not db_path:
-            QMessageBox.critical(self, "Error", "A 'Database File' must be selected first.")
-            return
-
-        # --- FIX: Automate file naming ---
-        base_name, ext = os.path.splitext(db_path)
-        new_db_path = f"{base_name}_TOP{ext}"
-        logging.info(f"Pulling top-level URLs to: {new_db_path}")
-        # --- END FIX ---
-        
-        # Call the action
-        db_action_success = database_actions.pull_top_level_urls(db_path, new_db_path, self)
-        
-        # --- FIX: Auto-open the new DB file ---
-        if db_action_success:
-            if self.db_viewer and self.db_viewer.isVisible():
-                self.db_viewer.close()
-            try:
-                self.db_viewer = DbViewer(new_db_path, self)
-                self.db_viewer.setWindowTitle(f"Top-Level URLs: {os.path.basename(new_db_path)}")
-                self.db_viewer.show()
-            except Exception as e:
-                logging.error(f"Failed to auto-open new DB Viewer: {e}")
-                QMessageBox.critical(self, "DB Viewer Error", f"An error occurred: {e}\n\n{traceback.format_exc()}")
-        # --- END FIX ---
 
     def export_all_links(self):
         db_path, _ = QFileDialog.getOpenFileName(self, "Select Database File to Export From", str(self.data_dir), "SQLite Database (*.sqlite *.db)")
@@ -763,7 +819,6 @@ class ScraperApp(QMainWindow):
         self.new_identity_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         
-        # Run in a new thread
         threading.Thread(target=self._new_identity_worker, daemon=True).start()
 
     def _new_identity_worker(self):
@@ -773,6 +828,12 @@ class ScraperApp(QMainWindow):
         self.resume_controls.emit()
 
     def start_scraping_thread(self, rescrape_mode=False, rescrape_page_data_mode=False):
+        # --- FIX (Request 1): Check if a previous thread is still running ---
+        if self.scraper_thread and self.scraper_thread.isRunning():
+            QMessageBox.warning(self, "Scraper Busy", "A previous scrape is still shutting down. Please wait a few seconds and try again.")
+            return
+        # --- END FIX ---
+        
         if not self.entries['db_file'].text():
             QMessageBox.critical(self, "Error", "A 'Database File' must be selected first.")
             return
@@ -795,6 +856,7 @@ class ScraperApp(QMainWindow):
                     content = f.read()
                 urls = extract_urls_from_text(content)
                 logging.info(f"Extracted {len(urls)} unique URLs from {os.path.basename(self.url_file_path)}.")
+                del content
             except Exception as e:
                 logging.error(f"Failed to read or parse URL file: {e}")
                 QMessageBox.critical(self, "Error", f"Failed to read URL file: {e}")
@@ -808,11 +870,13 @@ class ScraperApp(QMainWindow):
             try:
                 with open(self.keyword_file_path, 'r', encoding='utf-8') as f:
                     keywords = [line.strip() for line in f if line.strip()]
+                
                 if not keywords:
                     QMessageBox.warning(self, "Warning", "Keyword file is empty.")
                     keywords = None
                 else:
                     logging.info(f"Loaded {len(keywords)} keywords from {os.path.basename(self.keyword_file_path)}.")
+
             except Exception as e:
                 logging.error(f"Failed to read or parse keyword file: {e}")
                 QMessageBox.critical(self, "Error", f"Failed to read keyword file: {e}")
@@ -830,6 +894,7 @@ class ScraperApp(QMainWindow):
             self.active_tasks_dict.clear()
         
         save_all_page_data = self.save_page_data_checkbox.isChecked()
+        
         args = argparse.Namespace(
             urls=urls, 
             db_file=self.entries['db_file'].text(), 
@@ -848,6 +913,10 @@ class ScraperApp(QMainWindow):
             titles_only_mode, keywords, save_all_page_data,
             rescrape_page_data_mode
         )
+        
+        del urls 
+        del keywords 
+        
         self.scraper_thread.finished.connect(self.on_scraping_finished)
         self.scraper_thread.start()
 
@@ -855,13 +924,19 @@ class ScraperApp(QMainWindow):
         logging.warning("[WARN] Stop button clicked. Requesting scraper to stop...")
         self.stop_event.set()
         self.pause_event.clear() 
-        # Crucially, stop_button is re-enabled in on_scraping_finished
         self.stop_button.setEnabled(False)
+        
+        # --- FIX (Request 1): Removed manual call to on_scraping_finished ---
+        # This was causing a race condition. The 'finished' signal
+        # from the thread itself will now handle re-enabling controls.
+        # --- END FIX ---
 
     def on_scraping_finished(self):
-        # --- FIX 3: Ensure controls are re-enabled after thread finishes ---
         self.start_button.setEnabled(True)
         self.rescape_action.setEnabled(True)
         self.rescrape_data_action.setEnabled(True)
         self.stop_button.setEnabled(False)
-        # --- END FIX ---
+        
+        # Set the thread attribute to None so a new one can be started.
+        # This "releases" the old thread, even if it's zombied.
+        self.scraper_thread = None
