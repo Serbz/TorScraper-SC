@@ -8,12 +8,17 @@ import asyncio
 import traceback
 import time 
 import warnings
+import re # <-- Import re at top level
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from curl_cffi.requests import AsyncSession
+# --- FIX: Import specific errors to suppress them from GUI ---
+from curl_cffi.requests.exceptions import ProxyError
+from curl_cffi.curl import CurlError
+# --- END FIX ---
 
-from utils import PROXIES, HEADERS
+from utils import PROXIES, HEADERS, is_junk_url
 from database import DatabaseManager
 
 # Suppress the XMLParsedAsHTMLWarning
@@ -42,7 +47,8 @@ async def get_data(url, task_id, worker_id, active_tasks_dict, active_tasks_lock
             "worker_id": worker_id, # <-- STORE WORKER ID
             "url": url, 
             "site": site_name, 
-            "bytes": 0, 
+            "bytes": 0,
+            "title": "Pending...", # <-- FIX (Request 2): Add title field
             "finished_at": None
         }
 
@@ -59,9 +65,15 @@ async def get_data(url, task_id, worker_id, active_tasks_dict, active_tasks_lock
             else:
                 logging.warning(f"[{worker_id}] [FAIL] Failed to fetch {url} | Status: {response.status_code}")
     except Exception as e:
-        # Don't log CancelledError as an error
-        if not isinstance(e, asyncio.CancelledError):
+        # --- FIX: Log common network errors to DEBUG (file only) ---
+        if isinstance(e, (ProxyError, CurlError)):
+            # This is an expected network failure (e.g., site is down).
+            # Log it at DEBUG level so it goes to the file but not the GUI.
+            logging.debug(f"[{worker_id}] [NETWORK FAIL] Fetching {url}: {e}")
+        elif not isinstance(e, asyncio.CancelledError):
+            # This is an unexpected error.
             logging.error(f"[{worker_id}] [ERROR] Fetching {url}: {e}")
+        # --- END FIX ---
         raise # Re-raise the exception to be handled by the worker
     
     finally:
@@ -69,6 +81,10 @@ async def get_data(url, task_id, worker_id, active_tasks_dict, active_tasks_lock
             if task_id in active_tasks_dict:
                 # Mark as finished instead of deleting
                 active_tasks_dict[task_id]['finished_at'] = time.time()
+                # --- FIX (Request 2): Set failed title ---
+                if active_tasks_dict[task_id]['title'] == "Pending...":
+                     active_tasks_dict[task_id]['title'] = "Scrape Failed"
+                # --- END FIX ---
     
     return None 
 
@@ -87,12 +103,11 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
         return [], title, "", None # Return empty values for other fields
     
     page_text = soup.get_text(separator=' ', strip=True)
-    page_text_lower = "" 
     matching_keyword = None
 
+    # --- FIX (Request 1): Handle REGEX: prefix ---
     if keywords:
             try:
-                # 1. Prepare and Pad Page Text (Only once!)
                 page_text_lower = page_text.lower()
                 # Pad the whole document with spaces for reliable whole-word matching
                 page_text_padded = f" {page_text_lower} " 
@@ -100,22 +115,33 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
                 unique_matches_found = set()
                 
                 for keyword in keywords:
-                    keyword_lower = keyword.lower()
+                    if keyword.startswith("REGEX: "):
+                        # This is a regular expression
+                        try:
+                            # Get the regex pattern (remove "REGEX: ")
+                            pattern = keyword[7:].strip()
+                            # Run re.search on the *original* case-sensitive text
+                            if re.search(pattern, page_text, re.IGNORECASE): 
+                                unique_matches_found.add(keyword) # Add the full "REGEX: ..." string
+                                logging.info(f"[KEYWORD HIT] Regex '{pattern}' matched at {base_url}")
+                        except re.error as e:
+                            logging.warning(f"Invalid regex in keyword file: '{keyword}'. Error: {e}")
                     
-                    # 2. Determine Search Term
-                    # If keyword contains a space (multi-word), search for it as-is.
-                    if ' ' in keyword_lower:
-                        padded_search_term = keyword_lower
-                    # If it's a single word, pad it with spaces for whole-word matching.
                     else:
-                        padded_search_term = f" {keyword_lower} " 
+                        # This is a plain text keyword
+                        keyword_lower = keyword.lower()
+                        
+                        if ' ' in keyword_lower:
+                            # Multi-word: search as-is
+                            padded_search_term = keyword_lower
+                        else:
+                            # Single word: use word boundary logic
+                            padded_search_term = f" {keyword_lower} " 
 
-                    # 3. Perform Search
-                    if padded_search_term in page_text_padded:
-                        unique_matches_found.add(keyword) # Store the original, un-padded keyword (e.g., "AI")
-                        logging.info(f"[KEYWORD HIT] Found '{keyword}' at {base_url}")
+                        if padded_search_term in page_text_padded:
+                            unique_matches_found.add(keyword) # Store the original cased keyword
+                            logging.info(f"[KEYWORD HIT] Found '{keyword}' at {base_url}")
                 
-                # 4. Join all unique matches into a single, comma-separated string for storage
                 if unique_matches_found:
                     # Store keywords alphabetically for consistency
                     matching_keyword = ", ".join(sorted(list(unique_matches_found)))
@@ -124,14 +150,22 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
 
             except Exception as e:
                 logging.error(f"Error during keyword search at {base_url}: {e}")
+    # --- END FIX ---
 
-            found_links = set()
+    found_links = set()
     for link in soup.find_all('a', href=True):
         href = link['href']
         absolute_link = urljoin(base_url, href).rstrip('/')
+        
+        # --- FIX: Add junk filter ---
+        # Note: This is redundant if database.py is also filtering,
+        # but provides defense-in-depth.
+        if is_junk_url(absolute_link):
+            continue
+        # --- END FIX ---
+        
         parsed_link = urlparse(absolute_link)
         
-        # --- Efficiency Suggestion: Filter links before adding ---
         if any(parsed_link.path.lower().endswith(ext) for ext in NON_HTML_EXTENSIONS):
             continue
         
@@ -156,6 +190,23 @@ async def scraper_worker_task(worker_id, queue, stop_event, pause_event,
     queue and processes it.
     """
     while not stop_event.is_set():
+        # --- FIX: Status defaults to 2 (fail) ---
+        status = 2 # Assume fail
+        # --- END FIX ---
+        
+        # --- FIX: Need url and db handle in finally block ---
+        url = None
+        db = None
+        task_id = None
+        # --- END FIX ---
+        
+        # --- FIX: Define variables for DB update ---
+        new_links = []
+        title_to_save = "Scrape Failed"
+        keyword_match_to_save = None
+        page_data_to_save = None
+        # --- END FIX ---
+            
         try:
             # --- 1. Check for Pause Event ---
             if pause_event.is_set():
@@ -173,22 +224,16 @@ async def scraper_worker_task(worker_id, queue, stop_event, pause_event,
             except asyncio.TimeoutError:
                 continue # Loop back to check stop/pause
             
-            # --- MODIFIED: Added try/finally to guarantee task_done() ---
+            
             try:
                 # --- 3. Process the URL ---
                 result = await get_data(url, task_id, worker_id, active_tasks_dict, active_tasks_lock)
                 
-                # --- STOP FIX: Check event *after* await ---
                 if stop_event.is_set():
                     logging.warning(f"[{worker_id}] Stop requested. Discarding result for {url}. DB not updated.")
-                    continue # Skips to finally, DB is not touched
+                    continue 
                     
-                new_links = []
-                title_to_save = "Scrape Failed"
-                status = 2 # Assume fail
-                keyword_match_to_save = None
-                page_data_to_save = None
-
+                # --- This block is now only for SUCCESSFUL fetches ---
                 if isinstance(result, bytes): # Fetch success
                     try:
                         # Decode content
@@ -204,56 +249,96 @@ async def scraper_worker_task(worker_id, queue, stop_event, pause_event,
                         title_to_save = title
                         keyword_match_to_save = matching_keyword
                         
-                        # Decide whether to save page data
+                        # --- FIX (Request 2): Update title in active dict ---
+                        with active_tasks_lock:
+                            if task_id in active_tasks_dict:
+                                active_tasks_dict[task_id]['title'] = title_to_save
+                        # --- END FIX ---
+                        
                         if save_all_page_data:
                             page_data_to_save = page_text 
                         elif matching_keyword:
                             page_data_to_save = page_text 
                         
                         if titles_only_mode:
-                            # Special case: Only update title, don't change status or add links
+                            # We can update here, as it's a lighter operation
                             db.update_titles_batch([(title_to_save, url)])
-                            continue # Skips to finally
+                            status = 1 # Mark as success
+                            continue # Skip the main DB update logic
                         else:
                             status = 1 # Full scrape success
                     
                     except Exception as e:
                         logging.error(f"[{worker_id}] Error parsing content from {url}: {e}")
                         # status remains 2, title remains "Scrape Failed"
-
-                # --- STOP FIX: Check event *before* DB write ---
-                if stop_event.is_set():
-                    logging.warning(f"[{worker_id}] Stop requested. Discarding DB update for {url}.")
-                    continue # Skips to finally, DB is not touched
-
-                # --- 4. Update Database ---
-                if titles_only_mode:
-                    # This block is now only for title-only mode success
-                    db.update_titles_batch([(title_to_save, url)])
-                else:
-                    # This block is for full scrape (success or fail)
-                    db.update_links_batch([(status, title_to_save, keyword_match_to_save, page_data_to_save, url)])
                 
-                if status == 1 and new_links and not titles_only_mode:
-                    db.add_links(new_links, add_top_level_too=top_level_only_mode)
+                # Note: If result is None (e.g., 404), status remains 2
+                # and title_to_save remains "Scrape Failed", which is correct.
 
             except asyncio.CancelledError:
                 logging.info(f"[{worker_id}] Task for {url} was cancelled.")
-                # Do not update DB, just let finally run.
+                # Re-raise to be caught by outer loop and exit
+                raise
             except Exception as e:
-                logging.error(f"[{worker_id}] Error in worker processing {url}: {e}\n{traceback.format_exc()}")
-                # Do not update DB, just let finally run.
+                # --- FIX: Log common network errors to DEBUG (file only) ---
+                # Check if the exception is a common, expected network error.
+                # We want to log these to the file (DEBUG) but not flood the GUI (ERROR).
+                if isinstance(e, (ProxyError, CurlError)):
+                    # Log at DEBUG level: file_handler will see this, gui_handler will NOT.
+                    logging.debug(f"[{worker_id}] Network error for {url}: {e}\n{traceback.format_exc()}")
+                else:
+                    # This is an unexpected error (e.g., parsing, logic), log it to the GUI.
+                    logging.error(f"[{worker_id}] Error in worker processing {url}: {e}\n{traceback.format_exc()}")
+                # --- END FIX ---
+                
+                # Status is already 2 (fail), title is "Scrape Failed"
+                # We will now fall through to the finally block to update the DB
             finally:
-                # --- 5. Signal Task Completion ---
-                # This *must* be called for every item, or queue.join() will hang.
-                queue.task_done()
-            # --- END MODIFIED ---
+                # --- 5. Signal Task Completion & DB Update ---
+                
+                # Don't update DB if stop was requested
+                if stop_event.is_set():
+                    logging.warning(f"[{worker_id}] Stop requested. Final DB update for {url} skipped.")
+                # --- FIX: This block now correctly handles all cases ---
+                else:
+                    try:
+                        if db and url: # Ensure we have a DB and URL to update
+                            
+                            if titles_only_mode:
+                                # If titles_only was successful, we `continue`d earlier.
+                                # If we are here, it's either a success that needs
+                                # its status=1 marked, OR a failure.
+                                # A simple title update is all that's needed.
+                                if status == 1: # Success
+                                    # This should have been caught by the `continue`
+                                    # but we'll be safe.
+                                    db.update_titles_batch([(title_to_save, url)])
+                                else: # Failure
+                                    db.update_titles_batch([(title_to_save, url)])
+                            
+                            else:
+                                # This is the main update for full-scrape mode (success or fail)
+                                db.update_links_batch([(status, title_to_save, keyword_match_to_save, page_data_to_save, url)])
+                            
+                            # Add new links (only happens on status=1 and not titles_only)
+                            if status == 1 and new_links and not titles_only_mode:
+                                db.add_links(new_links, add_top_level_too=top_level_only_mode)
+                                
+                    except Exception as e:
+                        logging.error(f"[{worker_id}] CRITICAL: Failed to update DB for {url}: {e}")
+                # --- END FIX ---
+
+                with active_tasks_lock:
+                    if task_id in active_tasks_dict:
+                        active_tasks_dict[task_id]['status'] = status
+                
+                if db: # db might be None if queue.get() times out
+                    queue.task_done()
 
         except asyncio.CancelledError:
             logging.info(f"[{worker_id}] Worker shutting down.")
             break # Exit the main while loop
         except Exception as e:
-            # This is a critical error outside the item processing loop
             logging.error(f"[{worker_id}] Critical worker error: {e}")
             await asyncio.sleep(0.1) 
 
@@ -261,7 +346,7 @@ async def scraper_worker_task(worker_id, queue, stop_event, pause_event,
 async def scraper_main_producer(queue, args, stop_event, 
                               rescrape_mode=False, top_level_only_mode=False, 
                               onion_only_mode=False, titles_only_mode=False, keywords=None,
-                              rescrape_page_data_mode=False): # Added new mode
+                              rescrape_page_data_mode=False): 
     """
     The main async function (PRODUCER) for the scraper logic.
     It finds links and adds them to the queue for the workers.
@@ -273,7 +358,7 @@ async def scraper_main_producer(queue, args, stop_event,
         logging.info("[INFO] Starting in TOP-LEVEL-ONLY scrape mode.")
     if rescrape_mode:
         logging.info("[INFO] Starting in RESCRAPE mode.")
-    if rescrape_page_data_mode: # New log
+    if rescrape_page_data_mode: 
         logging.info("[INFO] Starting in RESCRAPE FOR PAGE DATA mode.")
     if onion_only_mode:
         logging.info("[INFO] Starting in ONION-ONLY scrape mode.")
@@ -281,11 +366,9 @@ async def scraper_main_producer(queue, args, stop_event,
         logging.info("[INFO] Starting in TITLES-ONLY scrape mode.")
     if keywords:
         logging.info(f"[INFO] Starting with {len(keywords)} keywords.")
-    if args.save_all_page_data: # Accessing via args
+    if args.save_all_page_data: 
         logging.info("[INFO] 'Save all page data' is ENABLED.")
 
-    # Keep track of URLs we've *added* to the queue to avoid duplicates
-    # in a single run (e.g., if link appears in DB multiple times)
     processed_in_this_run = set()
 
     try:
@@ -304,11 +387,15 @@ async def scraper_main_producer(queue, args, stop_event,
                 for url in links_to_process:
                     if stop_event.is_set(): break
                     if url not in processed_in_this_run:
+                        # --- FIX: Add junk filter ---
+                        if is_junk_url(url):
+                            logging.warning(f"Skipping junk URL (rescrape): {url}")
+                            continue
+                        # --- END FIX ---
                         task_id = f"{url}_{random.randint(10000, 99999)}"
                         await queue.put((db, url, task_id))
                         processed_in_this_run.add(url)
         
-        # --- NEW MODE ---
         elif rescrape_page_data_mode:
             links_missing_data = db.get_links_missing_page_data()
             if not links_missing_data:
@@ -324,10 +411,14 @@ async def scraper_main_producer(queue, args, stop_event,
                 for url in links_to_process:
                     if stop_event.is_set(): break
                     if url not in processed_in_this_run:
+                        # --- FIX: Add junk filter ---
+                        if is_junk_url(url):
+                            logging.warning(f"Skipping junk URL (rescrape data): {url}")
+                            continue
+                        # --- END FIX ---
                         task_id = f"{url}_{random.randint(10000, 99999)}"
                         await queue.put((db, url, task_id))
                         processed_in_this_run.add(url)
-        # --- END NEW MODE ---
 
         else: # Normal or top-level scraping mode
             if args.urls:
@@ -338,7 +429,6 @@ async def scraper_main_producer(queue, args, stop_event,
             while not stop_event.is_set():
                 iteration_count += 1
                 
-                # Producer doesn't need to check pause_event, workers do.
                 if stop_event.is_set(): break
                 
                 if titles_only_mode:
@@ -350,7 +440,6 @@ async def scraper_main_producer(queue, args, stop_event,
                     links_for_this_depth = [link for link in links_for_this_depth if urlparse(link).netloc.endswith('.onion')]
                     logging.info(f"[INFO] Filtered to {len(links_for_this_depth)} .onion links for this iteration.")
 
-                # Filter out links already processed in this run
                 links_for_this_depth = [l for l in links_for_this_depth if l not in processed_in_this_run]
 
                 if not links_for_this_depth:
@@ -363,7 +452,6 @@ async def scraper_main_producer(queue, args, stop_event,
                     top_level_targets.discard(None)
                     db.add_links(list(top_level_targets)) 
                     all_unscraped_urls = set(db.get_unscraped_links())
-                    # Filter against all unscraped and already processed
                     links_to_process = [url for url in top_level_targets if url in all_unscraped_urls and url not in processed_in_this_run]
                     logging.info(f"\n--- Starting Top-Level Iteration {iteration_count} --- (Processing {len(links_to_process)} unique domains)")
                 else:
@@ -378,13 +466,20 @@ async def scraper_main_producer(queue, args, stop_event,
                 
                 for url in links_to_process:
                     if stop_event.is_set(): break
+                    
+                    # --- FIX: Add junk filter ---
+                    if is_junk_url(url):
+                        logging.warning(f"Skipping junk URL (new scrape): {url}")
+                        processed_in_this_run.add(url) # Add to set so we don't re-check
+                        continue
+                    # --- END FIX ---
+                    
                     task_id = f"{url}_{random.randint(10000, 99999)}"
                     await queue.put((db, url, task_id))
                     processed_in_this_run.add(url)
                 
                 if stop_event.is_set(): break
 
-                # Wait for the queue to drain before finding new links
                 logging.info(f"--- Iteration {iteration_count} links queued. Waiting for queue to drain... ---")
                 await queue.join()
                 
@@ -394,9 +489,7 @@ async def scraper_main_producer(queue, args, stop_event,
                 
                 if titles_only_mode:
                     logging.info("[INFO] Titles-Only mode complete. Stopping producer.")
-                    break # Titles only mode doesn't loop
-                
-                # Check for links again in the next loop
+                    break 
             
     except Exception as e:
         logging.error(f"Error in scraper producer: {e}\n{traceback.format_exc()}")
