@@ -94,8 +94,7 @@ def run_as_admin():
 
 
 # --- 3. Main Application Imports ---
-# --- MODIFIED: Imports are now deferred until after install check ---
-# ... (Imports removed from here) ...
+# Imports are deferred until after install check
 
 # --- 4. Main Execution ---
 if __name__ == "__main__":
