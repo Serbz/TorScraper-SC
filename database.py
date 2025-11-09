@@ -372,6 +372,16 @@ class DatabaseManager:
             self.conn.row_factory = None # Ensure default
             self.conn.executemany("UPDATE links SET title = ? WHERE url = ?", update_data)
 
+    # --- NEW FUNCTION TO FIX THE BUG ---
+    def update_status_and_title_batch(self, update_data):
+        """Updates only the scraped status and title for a batch of URLs."""
+        if not update_data:
+            return
+        with self.conn:
+            self.conn.row_factory = None # Ensure default
+            self.conn.executemany("UPDATE links SET scraped = ?, title = ? WHERE url = ?", update_data)
+    # --- END NEW FUNCTION ---
+
     def reset_failed_links(self):
         with self.conn:
             self.conn.row_factory = None # Ensure default
