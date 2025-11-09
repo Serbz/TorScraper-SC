@@ -1,8 +1,8 @@
 """
 Contains PySide6 components for the GUI, including:
-- QThreads for background tasks (DbDataWorker, ScraperWorker)
-- QDialogs for modal windows (DbViewer)
+- QThreads for background tasks (DbWorker, ScraperWorker)
 - Custom QObjects for logging (QLogHandler)
+- Re-usable dialogs (TextEditorDialog, DataViewerDialog)
 """
 
 import os
@@ -13,459 +13,205 @@ import asyncio
 import time 
 import sys
 import csv 
+import shutil
 from urllib.parse import urlparse 
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QGroupBox, QLabel, QLineEdit,
                                QPushButton, QTextEdit, QMessageBox, QFileDialog, QDialog, QCheckBox,
                                QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QMenu,
-                               QTableView) 
+                               QTableView, QDialogButtonBox) 
 from PySide6.QtCore import (QObject, Signal, QThread, Qt, QAbstractTableModel, 
                             QModelIndex) 
 from PySide6.QtGui import QColor, QTextCursor, QFont, QAction
 
 from scraper import scraper_main_producer, scraper_worker_task
+# Import DatabaseManager to be used only inside DbWorker for execution
+from database import DatabaseManager 
+from database_actions import DbViewer # Import DbViewer from its new home
+from utils import MODE_PAGINATE, MODE_PULL_TOP_LEVEL, MODE_PULL_KEYWORDS 
 
-# --- GUI Worker Threads & Components ---
+# --- NEW: Text Editor Dialog (Request 2) ---
 
-class DbDataWorker(QThread):
+class TextEditorDialog(QDialog):
     """
-    Worker thread to get total row count and first page of data from DB
-    without freezing the GUI.
+    A simple dialog for editing a text file (URL or Keyword list).
     """
-    data_ready = Signal(int, list, list)  # Emits (total_rows, column_names_list, rows_data_list)
-
-    def __init__(self, file_path, limit):
-        super().__init__()
-        self.file_path = file_path
-        self.limit = limit
-
-    def run(self):
-        total_rows = 0
-        columns = []
-        rows_data = []
-        try:
-            conn = sqlite3.connect(self.file_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            table_name = 'links'
-
-            # Get table header
-            cursor.execute(f"PRAGMA table_info({table_name});")
-            columns = [info[1] for info in cursor.fetchall()]
-
-            # Get total row count
-            cursor.execute(f"SELECT COUNT(*) FROM {table_name};")
-            result = cursor.fetchone()
-            if result:
-                total_rows = result[0]
-
-            if total_rows > 0:
-                # Get first chunk of rows
-                cursor.execute(f"SELECT * FROM {table_name} LIMIT ? OFFSET 0;", (self.limit,))
-                rows = cursor.fetchall()
-                for row in rows:
-                    row_data = [str(row[col] if row[col] is not None else 'NULL') for col in columns]
-                    rows_data.append(row_data)
-            
-            conn.close()
-        except Exception as e:
-            logging.error(f"DB Worker Error: {e}")
-            columns = ['Error']
-            rows_data = [[f"Error loading database file: {e}"]]
-            total_rows = 0
-
-        self.data_ready.emit(total_rows, columns, rows_data)
-
-class DbViewer(QDialog):
-    """A simple dialog window to view the contents of a SQLite database file with pagination."""
     def __init__(self, file_path, parent=None):
         super().__init__(parent)
         self.file_path = file_path
-        self.offset = 0
-        self.limit = 200  # Show 200 rows per page
-        self.total_rows = 0
-        self.column_names = [] # Store column names
-        self.id_column_index = -1 # Store index of 'id' column
-
-        self.setWindowTitle(f"Viewing: {os.path.basename(file_path)}")
-        self.setGeometry(200, 200, 800, 600)
         
-        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint)
-
+        if self.file_path:
+            self.setWindowTitle(f"Editing: {os.path.basename(self.file_path)}")
+        else:
+            self.setWindowTitle("New File")
+            
+        self.setGeometry(250, 250, 500, 600)
+        
         layout = QVBoxLayout(self)
         
-        self.table_viewer = QTableWidget()
-        self.table_viewer.setFont(QFont("Courier"))
-        self.table_viewer.setWordWrap(False) 
-        self.table_viewer.setEditTriggers(QAbstractItemView.NoEditTriggers) 
-        self.table_viewer.setSelectionBehavior(QAbstractItemView.SelectRows) 
-        self.table_viewer.verticalHeader().setVisible(False) 
+        self.text_edit = QTextEdit()
+        self.text_edit.setFont(QFont("Courier", 10))
+        self.text_edit.setAcceptRichText(False)
+        layout.addWidget(self.text_edit)
         
-        self.table_viewer.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.table_viewer.customContextMenuRequested.connect(self.open_context_menu)
+        button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Close)
+        button_box.accepted.connect(self.save_file)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
         
-        layout.addWidget(self.table_viewer)
+        self.load_file_content()
 
-        # --- Navigation Controls ---
-        nav_layout = QHBoxLayout()
-        self.prev_button = QPushButton("<< Previous")
-        self.prev_button.clicked.connect(self.prev_page)
-        self.export_button = QPushButton("Export View")
-        self.export_button.clicked.connect(self.export_view)
-        self.next_button = QPushButton("Next >>")
-        self.next_button.clicked.connect(self.next_page)
-        self.page_label = QLabel("Page: N/A")
-        
-        nav_layout.addWidget(self.prev_button)
-        nav_layout.addStretch()
-        nav_layout.addWidget(self.page_label)
-        nav_layout.addWidget(self.export_button)
-        nav_layout.addStretch()
-        nav_layout.addWidget(self.next_button)
-        layout.addLayout(nav_layout)
+    def load_file_content(self):
+        """Loads text from self.file_path into the text editor."""
+        if self.file_path and os.path.exists(self.file_path):
+            try:
+                with open(self.file_path, 'r', encoding='utf-8') as f:
+                    self.text_edit.setPlainText(f.read())
+                logging.info(f"Loaded {self.file_path} into editor.")
+            except Exception as e:
+                logging.error(f"Failed to load file {self.file_path}: {e}")
+                QMessageBox.critical(self, "Load Error", f"Failed to load file:\n{e}")
 
-        self.prev_button.setEnabled(False)
-        self.next_button.setEnabled(False)
-        self.export_button.setEnabled(False)
-        self.table_viewer.setRowCount(1)
-        self.table_viewer.setColumnCount(1)
-        self.table_viewer.setItem(0, 0, QTableWidgetItem("Loading database information..."))
-
-        self.data_worker = DbDataWorker(self.file_path, self.limit)
-        self.data_worker.data_ready.connect(self.on_data_ready)
-        self.data_worker.start()
-
-    def open_context_menu(self, position):
-        menu = QMenu()
-        
-        item = self.table_viewer.itemAt(position)
-        
-        copy_row_action = QAction("Copy contents of row to clipboard", self)
-        copy_row_action.triggered.connect(self.copy_row)
-        menu.addAction(copy_row_action)
-
-        copy_cell_action = QAction("Copy contents of cell to clipboard", self)
-        copy_cell_action.triggered.connect(self.copy_cell)
-        menu.addAction(copy_cell_action)
-
-        menu.addSeparator()
-
-        set_null_action = QAction("Set NULL", self)
-        set_null_action.triggered.connect(self.set_cell_null)
-        menu.addAction(set_null_action)
-
-        delete_row_action = QAction("Delete row", self)
-        delete_row_action.triggered.connect(self.delete_row)
-        menu.addAction(delete_row_action)
-
-        if not item:
-            copy_row_action.setEnabled(False)
-            copy_cell_action.setEnabled(False)
-            set_null_action.setEnabled(False)
-            delete_row_action.setEnabled(False)
-        else:
-            can_modify = self.id_column_index != -1
-            set_null_action.setEnabled(can_modify)
-            delete_row_action.setEnabled(can_modify)
+    def save_file(self):
+        """Saves the content of the text editor back to the file."""
+        if not self.file_path:
+            # If file path is blank, open a "Save As" dialog
+            path, _ = QFileDialog.getSaveFileName(self, "Save File As", "", "Text Files (*.txt)")
+            if not path:
+                return # User cancelled
+            self.file_path = path
             
-            col_name = self.column_names[item.column()]
-            if col_name in ('id', 'url'):
-                set_null_action.setEnabled(False)
-        
-        menu.exec(self.table_viewer.viewport().mapToGlobal(position))
-
-    def copy_row(self):
-        current_row = self.table_viewer.currentRow()
-        if current_row < 0:
-            return
-        
-        row_data = []
-        for col in range(self.table_viewer.columnCount()):
-            item = self.table_viewer.item(current_row, col)
-            row_data.append(item.text() if item else "NULL")
-        
-        QApplication.clipboard().setText(" | ".join(row_data))
-        logging.info(f"Copied row {current_row} to clipboard.")
-
-    def copy_cell(self):
-        item = self.table_viewer.currentItem()
-        if not item:
-            return
-        
-        QApplication.clipboard().setText(item.text())
-        logging.info("Copied cell to clipboard.")
-
-    def set_cell_null(self):
-        item = self.table_viewer.currentItem()
-        if not item or self.id_column_index == -1:
-            return
-            
-        current_row = item.row()
-        current_col = item.column()
-        col_name = self.column_names[current_col]
-        
-        id_item = self.table_viewer.item(current_row, self.id_column_index)
-        if not id_item:
-            logging.error("Could not find ID item for row.")
-            return
-
-        row_id = id_item.text()
-
-        reply = QMessageBox.warning(self, "Confirm Set NULL",
-                                    f"Are you sure you want to set column '{col_name}' to NULL for row ID {row_id}?\n\nThis cannot be undone.",
-                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        
-        if reply == QMessageBox.No:
-            return
-
         try:
-            conn = sqlite3.connect(self.file_path)
-            conn.execute(f"UPDATE links SET {col_name} = NULL WHERE id = ?", (row_id,))
-            conn.commit()
-            conn.close()
-            item.setText("NULL")
-            logging.info(f"Set {col_name} to NULL for ID {row_id}")
+            with open(self.file_path, 'w', encoding='utf-8') as f:
+                f.write(self.text_edit.toPlainText())
+            logging.info(f"Saved changes to {self.file_path}")
+            self.accept() # Close the dialog on success
         except Exception as e:
-            logging.error(f"Failed to set cell to NULL: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to update database: {e}")
-
-    def delete_row(self):
-        current_row = self.table_viewer.currentRow()
-        if current_row < 0 or self.id_column_index == -1:
-            return
-
-        id_item = self.table_viewer.item(current_row, self.id_column_index)
-        if not id_item:
-            logging.error("Could not find ID item for row.")
-            return
-        
-        row_id = id_item.text()
-
-        reply = QMessageBox.warning(self, "Confirm Delete",
-                                    f"Are you sure you want to permanently delete row ID {row_id}?\n\nThis cannot be undone.",
-                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        
-        if reply == QMessageBox.No:
-            return
-
-        try:
-            conn = sqlite3.connect(self.file_path)
-            conn.execute("DELETE FROM links WHERE id = ?", (row_id,))
-            conn.commit()
-            conn.close()
+            logging.error(f"Failed to save file {self.file_path}: {e}")
+            QMessageBox.critical(self, "Save Error", f"Failed to save file:\n{e}")
             
-            self.table_viewer.removeRow(current_row)
-            self.total_rows -= 1
-            self.update_nav_buttons()
-            logging.info(f"Deleted row ID {row_id}")
-        except Exception as e:
-            logging.error(f"Failed to delete row: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to delete row from database: {e}")
+# --- END Text Editor Dialog ---
 
-    def on_data_ready(self, total_rows, column_names, rows_data):
-        """Slot to handle the result from the DbDataWorker thread."""
-        self.total_rows = total_rows
-        self.column_names = column_names
-        
-        try:
-            self.id_column_index = self.column_names.index('id')
-        except ValueError:
-            self.id_column_index = -1
-            logging.warning("No 'id' column found in database. Modify/Delete actions will be disabled.")
-            
-        self.table_viewer.setColumnCount(len(self.column_names))
-        self.table_viewer.setHorizontalHeaderLabels(self.column_names)
-        
-        self.populate_table(rows_data)
-        self.update_nav_buttons()
 
-    def populate_table(self, rows_data):
-        """Clears and repopulates the QTableWidget with rows."""
-        self.table_viewer.setUpdatesEnabled(False)
-        self.table_viewer.setRowCount(0) 
-        
-        if not rows_data and self.total_rows == 0:
-            self.table_viewer.setRowCount(1)
-            self.table_viewer.setItem(0, 0, QTableWidgetItem("Database is empty."))
-            self.table_viewer.setUpdatesEnabled(True)
-            return
-            
-        self.table_viewer.setRowCount(len(rows_data))
-        for row_idx, row_data in enumerate(rows_data):
-            for col_idx, cell_data in enumerate(row_data):
-                item = QTableWidgetItem(cell_data)
-                self.table_viewer.setItem(row_idx, col_idx, item)
-        self.resize_columns()
-        self.table_viewer.setUpdatesEnabled(True) 
+# --- GUI Worker Threads ---
 
-    def resize_columns(self):
-        """Sets resize modes for table columns."""
-        header = self.table_viewer.horizontalHeader()
-        for i in range(len(self.column_names)):
-            col_name = self.column_names[i]
-            if col_name in ('id', 'scraped'):
-                header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
-            elif col_name == 'url':
-                header.setSectionResizeMode(i, QHeaderView.Interactive)
-                self.table_viewer.setColumnWidth(i, 250)
-            elif col_name in ('title', 'keyword_match', 'page_data'):
-                header.setSectionResizeMode(i, QHeaderView.Stretch)
-            else:
-                header.setSectionResizeMode(i, QHeaderView.Interactive)
+class DbWorker(QThread):
+    data_ready = Signal(int, list, list) 
+    file_action_complete = Signal(int, str, int, object) 
+    progress_update = Signal(int) # Signal to report percentage progress
 
-    def prev_page(self):
-        self.offset = max(0, self.offset - self.limit)
-        self.load_data_chunk()
+    def __init__(self, file_path, mode, offset=0, limit=200, keywords=None, threshold=1, total_rows_to_check=0, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.mode = mode
+        self.offset = offset
+        self.limit = limit
+        self.keywords = keywords
+        self.threshold = threshold
+        self.total_rows_to_check = total_rows_to_check # Stores the count determined in gui_main
 
-    def next_page(self):
-        self.offset += self.limit
-        self.load_data_chunk()
-
-    def export_view(self):
-        """Exports the current table view to a text file."""
-        if self.table_viewer.rowCount() == 0 or (self.table_viewer.rowCount() == 1 and self.table_viewer.item(0,0).text().startswith("Loading")):
-            QMessageBox.warning(self, "Export Error", "No data to export.")
-            return
-
-        # --- FIX 1: Add CSV and SQLite options ---
-        file_filter = "CSV Files (*.csv);;SQLite Database (*.sqlite);;Text Files (*.txt)"
-        path, selected_filter = QFileDialog.getSaveFileName(self, "Save View As", "", file_filter)
-        if not path:
-            return
-
-        try:
-            if "CSV Files" in selected_filter:
-                self._export_to_csv_from_table(path)
-            elif "SQLite Database" in selected_filter:
-                self._export_to_sqlite_from_table(path)
-            else: # Text file or fallback
-                self._export_to_txt_from_table(path)
-            
-            QMessageBox.information(self, "Success", f"Successfully exported view to {os.path.basename(path)}.")
-        except Exception as e:
-            QMessageBox.critical(self, "Export Error", f"An error occurred while saving the file:\n{e}")
-
-    def _export_to_txt_from_table(self, path):
-        """Exports visible table data to a plain text file."""
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(" | ".join(self.column_names) + "\n")
-            for row in range(self.table_viewer.rowCount()):
-                row_data = []
-                for col in range(self.table_viewer.columnCount()):
-                    item = self.table_viewer.item(row, col)
-                    row_data.append(item.text() if item else 'NULL')
-                f.write(" | ".join(row_data) + "\n")
-
-    def _export_to_csv_from_table(self, path):
-            """Exports visible table data to CSV with aggressive sanitization."""
-            
-            # NOTE: Using QUOTE_NONE requires every cell to be manually sanitized
-            # to ensure commas/newlines are removed, otherwise the CSV structure breaks.
-            with open(path, 'w', newline='', encoding='utf-8') as f:
-                # Use QUOTE_NONE for maximum manual control over content.
-                # Delimiter is comma by default.
-                writer = csv.writer(f, quoting=csv.QUOTE_NONE, escapechar='\\')
-                writer.writerow(self.column_names)
+    def run(self):
+            try:
+                # FIX: Send initial "Calculating" signal before running blocking operation
+                self.progress_update.emit(-1)
+                # END FIX
                 
-                for row_idx in range(self.table_viewer.rowCount()):
-                    row_data = []
-                    for col_idx in range(self.table_viewer.columnCount()):
-                        item = self.table_viewer.item(row_idx, col_idx)
-                        cell_data = item.text() if item else ""
-                        
-                        # --- AGGRESSIVE SANITIZATION ON ALL FIELDS ---
-                        # 1. Convert "NULL" text back to empty string for clean export
-                        if cell_data.upper() == "NULL":
-                            cell_data = ""
-                            
-                        # 2. Remove newlines (CRLF/LF)
-                        cell_data = cell_data.replace('\n', ' ')
-                        cell_data = cell_data.replace('\r', ' ')
-                        
-                        # 3. Remove quotes (both single and double)
-                        cell_data = cell_data.replace('"', '')
-                        cell_data = cell_data.replace("'", "")
-                        
-                        # 4. Remove internal commas to prevent CSV structure breakage
-                        # This is done on ALL fields to prevent quoting issues.
-                        cell_data = cell_data.replace(',', ' ')
-                        
-                        row_data.append(cell_data.strip())
+                db = DatabaseManager(self.file_path)
+                if self.mode == MODE_PAGINATE:
+                    self._run_paginate_query(db)
+                elif self.mode == MODE_PULL_TOP_LEVEL:
+                    self._run_pull_top_level(db)
+                elif self.mode == MODE_PULL_KEYWORDS:
+                    self._run_pull_keywords(db)
+            except Exception as e:
+                logging.error(f"[DB Worker ERROR] Mode {self.mode} failed for {self.file_path}: {e}\n{traceback.format_exc()}")
+                if self.mode != MODE_PAGINATE:
+                    self.file_action_complete.emit(self.mode, self.file_path, -1, None)
+                else:
+                    self.data_ready.emit(0, ['Error'], [[f"Database error: {e}"]])
+            finally:
+                if 'db' in locals():
+                    db.close()
                     
-                    # Write the sanitized row
-                    writer.writerow(row_data)
-                    
-    def _export_to_sqlite_from_table(self, path):
-        """Exports visible table data to a new SQLite database."""
-        if os.path.exists(path):
-            os.remove(path)
-            
-        conn = sqlite3.connect(path)
-        with conn:
-            cursor = conn.cursor()
-            col_defs = ", ".join([f'"{col}" TEXT' for col in self.column_names])
-            cursor.execute(f"CREATE TABLE links ({col_defs})")
-            
-            placeholders = ", ".join(["?"] * len(self.column_names))
-            
-            rows_to_insert = []
-            for row_idx in range(self.table_viewer.rowCount()):
-                row_data = []
-                for col_idx in range(self.table_viewer.columnCount()):
-                    item = self.table_viewer.item(row_idx, col_idx)
-                    row_data.append(item.text() if item else None)
-                rows_to_insert.append(tuple(row_data))
-                
-            cursor.executemany(f"INSERT INTO links VALUES ({placeholders})", rows_to_insert)
-        conn.close()
-
-    def update_nav_buttons(self):
-        self.prev_button.setEnabled(self.offset > 0)
-        self.next_button.setEnabled(self.offset + self.limit < self.total_rows)
-        self.export_button.setEnabled(self.total_rows > 0)
-        start_row = self.offset + 1
-        end_row = min(self.offset + self.limit, self.total_rows)
-        self.page_label.setText(f"Showing rows {start_row}-{end_row} of {self.total_rows}")
-
-    def load_data_chunk(self):
-        """Loads and displays a chunk of data from the database for Next/Previous clicks."""
+    def _run_paginate_query(self, db):
+        """
+        Pagination logic for live view.
+        Fetches all columns but truncates page_data for GUI speed. (Request 3)
+        """
+        total_rows = 0
+        columns = []
         rows_data = []
-        try:
-            conn = sqlite3.connect(self.file_path)
-            conn.row_factory = sqlite3.Row 
-            cursor = conn.cursor()
-            table_name = 'links'
+        
+        conn = db.conn 
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        table_name = 'links'
+        
+        # --- FIX: Select ALL columns, including page_data ---
+        cursor.execute(f"PRAGMA table_info({table_name});")
+        all_columns = [info[1] for info in cursor.fetchall()]
+        
+        columns_to_select = all_columns
+        select_clause = ", ".join([f'"{c}"' for c in columns_to_select])
+        columns = columns_to_select
+        # --- END FIX ---
+        
+        cursor.execute(f"SELECT COUNT(*) FROM {table_name};")
+        total_rows = cursor.fetchone()[0]
 
-            if not self.column_names:
-                cursor.execute(f"PRAGMA table_info({table_name});")
-                self.column_names = [info[1] for info in cursor.fetchall()]
-                try:
-                    self.id_column_index = self.column_names.index('id')
-                except ValueError:
-                    self.id_column_index = -1
-                self.table_viewer.setColumnCount(len(self.column_names))
-                self.table_viewer.setHorizontalHeaderLabels(self.column_names)
-
-            cursor.execute(f"SELECT * FROM {table_name} LIMIT ? OFFSET ?;", (self.limit, self.offset))
+        if total_rows > 0:
+            cursor.execute("SELECT {} FROM {} LIMIT ? OFFSET ?;".format(select_clause, table_name), (self.limit, self.offset))
             rows = cursor.fetchall()
+            
             for row in rows:
-                row_data = [str(row[col] if row[col] is not None else 'NULL') for col in self.column_names]
+                row_data = []
+                for col_name in columns_to_select:
+                    value = row[col_name]
+                    
+                    # --- FIX (Request 3): Truncate page_data to prevent GUI lag ---
+                    if col_name == 'page_data' and value is not None:
+                        str_value = str(value).replace('\n', ' ').replace('\r', ' ')
+                        if len(str_value) > 100:
+                            row_data.append(str_value[:100] + '...')
+                        else:
+                            row_data.append(str_value)
+                    # --- END FIX ---
+                    else:
+                        row_data.append(str(value if value is not None else 'NULL'))
+                
                 rows_data.append(row_data)
 
-            conn.close()
-            self.populate_table(rows_data)
-            self.update_nav_buttons()
+        self.data_ready.emit(total_rows, columns, rows_data)
 
-        except Exception as e:
-            self.table_viewer.setRowCount(1)
-            self.table_viewer.setItem(0, 0, QTableWidgetItem(f"Error loading database file:\n\n{e}"))
-            self.prev_button.setEnabled(False)
-            self.next_button.setEnabled(False)
-            self.export_button.setEnabled(False)
+    def _run_pull_keywords(self, db):
+        """Pulls keyword matches and writes them to a new file (memory efficient)."""
+        base_name, ext = os.path.splitext(self.file_path)
+        new_db_path = f"{base_name}_KW{ext}"
+        
+        count = db.filter_links_by_keyword_threshold_to_new_db(
+            new_db_path, 
+            self.keywords, 
+            self.threshold,
+            self.progress_update, 
+            self.total_rows_to_check
+        )
+        
+        self.file_action_complete.emit(self.mode, new_db_path, count, self.threshold)
 
+    def _run_pull_top_level(self, db):
+        """Pulls top level URLs and writes them to a new file."""
+        base_name, ext = os.path.splitext(self.file_path)
+        new_db_path = f"{base_name}_TOP{ext}"
+        
+        count = db.pull_top_level_to_new_db(
+            new_db_path,
+            self.progress_update, 
+            self.total_rows_to_check
+        )
+        
+        self.file_action_complete.emit(self.mode, new_db_path, count, None)
 
-# --- REFACTORED: DataViewerDialog (for Keyword Matches) ---
 
 class DataTableModel(QAbstractTableModel):
     """
@@ -532,10 +278,6 @@ class DataTableModel(QAbstractTableModel):
 class DataViewerDialog(QDialog):
     """
     A simple dialog to display a list of columns and rows, with no pagination.
-    Uses QTableView and a custom model for high performance.
-    
-    NOTE: This is no longer used for keyword matches due to memory constraints.
-    It is kept here for reference or future use of small result sets.
     """
     def __init__(self, column_names, rows_data, parent=None):
         super().__init__(parent)
@@ -595,7 +337,6 @@ class DataViewerDialog(QDialog):
 
     def export_results(self):
         """Exports the view to CSV or SQLite."""
-        # This dialog is now primarily for small result sets, keeping the functionality simple.
         file_filter = "CSV Files (*.csv);;SQLite Database (*.sqlite);;Text Files (*.txt)"
         path, selected_filter = QFileDialog.getSaveFileName(self, "Export Results", "", file_filter)
         
@@ -626,6 +367,7 @@ class DataViewerDialog(QDialog):
 
     def export_to_csv(self, path):
         """Exports data to CSV with sanitization."""
+        import csv 
         try:
             page_data_index = self.column_names.index('page_data')
         except ValueError:
@@ -651,6 +393,7 @@ class DataViewerDialog(QDialog):
                 writer.writerow(final_row)
 
     def export_to_sqlite(self, path):
+        import sqlite3
         if os.path.exists(path):
             os.remove(path)
             
@@ -714,6 +457,8 @@ class QLogHandler(logging.Handler, QObject):
 
 class ScraperWorker(QThread):
     """A QThread to run the asyncio scraper logic without blocking the GUI."""
+    finished = Signal()
+    
     def __init__(self, args, stop_event, pause_event, 
                  active_tasks_dict, active_tasks_lock, 
                  rescrape_mode=False, top_level_only_mode=False, 
@@ -761,46 +506,31 @@ class ScraperWorker(QThread):
         try:
             await producer_task
             
-            # --- FIX 2: Check stop_event before waiting for queue (Necessary for fast stop) ---
             if self.stop_event.is_set():
                 logging.warning("Stop requested. Bypassing queue.join() to cancel workers.")
             else:
                 logging.info("Producer finished. Waiting for workers to drain queue...")
-                # Only wait a short time before cancelling if stop is requested, 
-                # though the logic below handles the main bottleneck.
                 await queue.join()
                 logging.info("Queue empty. All tasks processed.")
-            # --- END FIX ---
 
         except Exception as e:
             logging.error(f"Error in async manager: {e}\n{traceback.format_exc()}")
         
         finally:
-            # --- FAST SHUTDOWN FIX: Prevent blocking on cancelled network calls ---
             logging.info("Cancelling worker tasks...")
             for task in worker_tasks:
-                task.cancel() # Aggressively cancel tasks
+                task.cancel() 
             
-            if self.stop_event.is_set():
-                # Wait a maximum of 5 seconds for tasks to acknowledge cancellation.
-                # This prevents blocking for the full 60-second network timeouts.
-                logging.warning("Fast stop initiated. Waiting 5s max for tasks to wrap up.")
-                await asyncio.wait(worker_tasks, timeout=5.0)
-            else:
-                # Normal shutdown, wait indefinitely for clean exit
-                await asyncio.gather(*worker_tasks, return_exceptions=True)
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
 
             logging.info("Scraper workers shut down complete. Emitting finished signal.")
-            # Signal the GUI thread that we are finished
-            self.finished.emit() # Ensure this signal is the last thing sent
-            
 
     def run(self):
         try:
             if sys.platform == "win32":
                 asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            # We don't use self.finished.emit() here, only in the finally block of run_async_logic
             asyncio.run(self.run_async_logic())
         except Exception as e:
             logging.error(f"[ERROR] Scraper thread error: {e}\n{traceback.format_exc()}")
-            self.finished.emit() # Ensure signal is sent on catastrophic failure
+        finally:
+            self.finished.emit()
