@@ -4,7 +4,27 @@ Contains the DatabaseManager class for handling all SQLite operations.
 
 import sqlite3
 import logging
-from utils import get_top_level_url
+from utils import get_top_level_url, is_junk_url
+import re 
+import os
+import shutil
+import traceback
+
+# --- NEW: Custom SQLite REGEXP function ---
+def sqlite_regexp(expression, item):
+    """
+    Implements a custom REGEXP function for SQLite.
+    Required for complex text matching in SQL queries.
+    """
+    if item is None:
+        return False
+    try:
+        # Use re imported at the top of the module
+        return re.search(expression, item, re.IGNORECASE) is not None
+    except re.error:
+        # If the regex is invalid, return False
+        return False
+# --- END NEW ---
 
 class DatabaseManager:
     """Handles all SQLite database operations."""
@@ -12,6 +32,11 @@ class DatabaseManager:
         self.db_path = db_path
         # Connect to the database, allowing the connection object to be shared across threads
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        
+        # --- FIX: Register REGEXP function on connection object ---
+        self.conn.create_function("REGEXP", 2, sqlite_regexp)
+        # --- END FIX ---
+        
         self.create_table()
         self.upgrade_table() # Add new columns if they don't exist
 
@@ -29,7 +54,6 @@ class DatabaseManager:
                 )
             """)
             self.conn.execute("CREATE INDEX IF NOT EXISTS url_index ON links (url)")
-            # --- ADDED: Index on 'scraped' column for fast lookups ---
             self.conn.execute("CREATE INDEX IF NOT EXISTS scraped_index ON links (scraped)")
 
     def upgrade_table(self):
@@ -50,224 +74,406 @@ class DatabaseManager:
             with self.conn:
                 self.conn.execute("ALTER TABLE links ADD COLUMN page_data TEXT")
 
-    def add_links(self, links, add_top_level_too=False):
-        """
-        Adds a list of new links to the database, ignoring duplicates.
-        Optionally adds their top-level counterparts as well.
-        """
-        # Normalize all incoming links by removing trailing slashes and duplicates
-        normalized_links_input = {link.rstrip('/') for link in links}
+    # --- FIX: Helper function to build correct schema string ---
+    def _build_create_table_schema(self, columns_to_insert):
+        """Builds a CREATE TABLE schema string with correct types."""
+        schema_parts = ["id INTEGER PRIMARY KEY"]
+        for col in columns_to_insert:
+            if col == 'scraped':
+                # This ensures the 'scraped' column is created correctly
+                schema_parts.append("scraped INTEGER DEFAULT 0")
+            elif col == 'url':
+                schema_parts.append("url TEXT UNIQUE NOT NULL")
+            else:
+                schema_parts.append(f'"{col}" TEXT')
+        return ", ".join(schema_parts)
+    # --- END FIX ---
 
-        links_to_add = []
-        if add_top_level_too:
-            processed_links = set()
-            for link in normalized_links_input:
-                # Add the full link if it hasn't been processed in this batch
-                if link not in processed_links:
-                    links_to_add.append((link,))
-                    processed_links.add(link)
-                # Extract and add the top-level link if it's valid and not already processed
-                top_level = get_top_level_url(link) # this will also be normalized
-                if top_level and top_level not in processed_links:
-                     links_to_add.append((top_level,))
-                     processed_links.add(top_level)
-        else:
-            # If not adding top-level, just prepare the original links
-            links_to_add = [(link,) for link in normalized_links_input]
-
-        if links_to_add:
-            with self.conn:
-                # INSERT OR IGNORE gracefully handles duplicates; they are simply not inserted
-                self.conn.executemany("INSERT OR IGNORE INTO links (url) VALUES (?)", links_to_add)
+    # --- UPDATED VALIDATION HELPER ---
+    def _get_and_validate_links(self, query):
+        """
+        Helper to run a query, check for NULLs on critical columns, 
+        and return a valid list of URLs.
+        """
+        links = []
+        try:
+            # Use row_factory to access columns by name
+            self.conn.row_factory = sqlite3.Row
+            cursor = self.conn.execute(query)
+            
+            for row in cursor.fetchall():
+                valid_row = True
+                
+                # --- NEW VALIDATION (Your Request) ---
+                if row['id'] is None:
+                    logging.error(f"[DATA INTEGRITY ERROR] Database contains a row with a NULL id. URL: {row['url']}")
+                    valid_row = False
+                
+                if not row['url']: # Checks for None or empty string
+                    logging.error(f"[DATA INTEGRITY ERROR] Database contains a row with a NULL or empty URL. ID: {row['id']}")
+                    valid_row = False
+                    
+                if row['scraped'] is None:
+                    # This will catch any old DBs that haven't been fixed.
+                    logging.error(f"[DATA INTEGRITY ERROR] Database contains a row with a NULL 'scraped' value. URL: {row['url']}. (Run the SQL fix script)")
+                    valid_row = False # Don't scrape it, it's in a bad state
+                
+                if valid_row:
+                    links.append(row['url'])
+            
+            # Reset row_factory to default
+            self.conn.row_factory = None
+            return links
+        
+        except sqlite3.OperationalError as e:
+            # This happens if a column (like 'scraped') doesn't exist.
+            logging.error(f"A database query failed, this may be an old DB version. Error: {e}")
+            self.conn.row_factory = None
+            return []
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during link validation: {e}")
+            self.conn.row_factory = None
+            return []
+    # --- END UPDATED HELPER ---
 
     def get_unscraped_links(self):
         """Gets all unscraped links (status 0)."""
-        with self.conn:
-            cursor = self.conn.execute("SELECT url FROM links WHERE scraped = 0")
-            return [row[0] for row in cursor.fetchall()]
+        # --- FIX: Use new validator. Only check for 0. ---
+        return self._get_and_validate_links("SELECT id, url, scraped FROM links WHERE scraped = 0")
             
     def get_all_links(self):
         """Gets all links from the database."""
-        with self.conn:
-            cursor = self.conn.execute("SELECT url FROM links")
-            return [row[0] for row in cursor.fetchall()]
+        # --- FIX: Use new validator. ---
+        return self._get_and_validate_links("SELECT id, url, scraped FROM links")
 
     def get_unscraped_links_missing_titles(self):
         """Gets all unscraped links (status 0) that are missing a valid title."""
-        with self.conn:
-            cursor = self.conn.execute("SELECT url FROM links WHERE scraped = 0 AND (title IS NULL OR title = 'No Title Found' OR title = 'Scrape Failed' OR title = '')")
-            return [row[0] for row in cursor.fetchall()]
+        # --- FIX: Use new validator. Only check for 0. ---
+        return self._get_and_validate_links("""
+            SELECT id, url, scraped FROM links 
+            WHERE scraped = 0
+            AND (title IS NULL OR title = 'No Title Found' OR title = 'Scrape Failed' OR title = '')
+        """)
 
     def get_failed_links(self):
         """Gets all failed links (status 2)."""
-        with self.conn:
-            cursor = self.conn.execute("SELECT url FROM links WHERE scraped = 2")
-            return [row[0] for row in cursor.fetchall()]
+        # --- FIX: Use new validator. ---
+        return self._get_and_validate_links("SELECT id, url, scraped FROM links WHERE scraped = 2")
 
     def get_links_missing_page_data(self):
         """Gets all *non-failed* links that are missing page data."""
-        with self.conn:
-            cursor = self.conn.execute("SELECT url FROM links WHERE scraped != 2 AND (page_data IS NULL OR page_data = '')")
-            return [row[0] for row in cursor.fetchall()]
+        # --- FIX: Use new validator. ---
+        return self._get_and_validate_links("SELECT id, url, scraped FROM links WHERE scraped != 2 AND (page_data IS NULL OR page_data = '')")
 
     def get_keyword_matches(self):
         """Gets all columns for rows that have a keyword match."""
-        # This function is retained but not used for threshold check.
         with self.conn:
+            # Reset row_factory in case _get_and_validate_links failed
+            self.conn.row_factory = None
             cursor = self.conn.execute("SELECT * FROM links WHERE keyword_match IS NOT NULL AND keyword_match != ''")
             rows = cursor.fetchall()
             columns = [description[0] for description in cursor.description]
             return columns, rows
 
-# --- database.py: inside DatabaseManager class ---
-
-    def get_keyword_matches_by_threshold(self, keywords, threshold):
+    def get_initial_keyword_match_count(self, keywords):
         """
-        Gets all columns for rows whose page_data contains at least 'threshold' 
+        Gets the total count of links matching at least one keyword in the 
+        keyword_match column. (Simplified COUNT for streaming setup).
+        """
+        if not keywords: return 0 
+
+        keyword_regex_parts = []
+        keyword_regex_values = []
+        
+        for keyword in keywords:
+            escaped_keyword = re.escape(keyword)
+            keyword_regex_parts.append("keyword_match REGEXP ?")
+            pattern = r'(^|,\s*)' + escaped_keyword + r'(\s*,|$)'
+            keyword_regex_values.append(pattern)
+
+        if not keyword_regex_parts:
+            return 0
+            
+        sql_filter = " OR ".join(keyword_regex_parts)
+        count_query = f"SELECT COUNT(*) FROM links WHERE keyword_match IS NOT NULL AND keyword_match != '' AND ({sql_filter})"
+        
+        with self.conn:
+            self.conn.row_factory = None # Ensure default
+            self.conn.create_function("REGEXP", 2, sqlite_regexp) 
+            cursor = self.conn.execute(count_query, keyword_regex_values)
+            return cursor.fetchone()[0]
+
+    def filter_links_by_keyword_threshold_to_new_db(self, new_db_path, keywords, threshold, progress_signal=None, total_rows_to_check=-1): 
+        """
+        Pulls links whose keyword_match column contains at least 'threshold' 
         unique keywords from the provided 'keywords' list.
         """
         if not keywords:
-            return [], [] 
+            return 0 
 
-        with self.conn:
-            # Fetch all rows that have page data
-            cursor = self.conn.execute("SELECT * FROM links WHERE page_data IS NOT NULL AND page_data != ''")
-            initial_rows = cursor.fetchall()
-            columns = [description[0] for description in cursor.description]
+        input_keywords_plain = {k.strip().lower() for k in keywords if not k.startswith("REGEX: ")}
+        input_keywords_regex = []
+        for k in keywords:
+            if k.startswith("REGEX: "):
+                try:
+                    pattern = k[7:].strip()
+                    input_keywords_regex.append((k, re.compile(pattern, re.IGNORECASE)))
+                except re.error as e:
+                    logging.warning(f"Invalid regex in keyword file (skipping): '{k}'. Error: {e}")
 
-        if not initial_rows:
-            return columns, []
+        sql_query_parts = []
+        sql_query_values = []
+        
+        for k in input_keywords_plain:
+            sql_query_parts.append("keyword_match REGEXP ?")
+            sql_query_values.append(r'(^|,\s*)' + re.escape(k) + r'(\s*,|$)')
+            
+        for original_string, pattern in input_keywords_regex:
+            sql_query_parts.append("keyword_match REGEXP ?")
+            sql_query_values.append(r'(^|,\s*)' + re.escape(original_string) + r'(\s*,|$)')
+        
+        if not sql_query_parts:
+            logging.warning("No valid keywords found for filtering.")
+            return 0
 
-        # --- MODIFIED: Prepare search terms exactly like in scraper.py ---
-        # Map original keyword to the search term (padded or non-padded)
-        search_terms_map = {} 
-        for keyword in keywords:
-            keyword_lower = keyword.lower()
-            if ' ' in keyword_lower:
-                search_term = keyword_lower
-            else:
-                search_term = f" {keyword_lower} " 
-            search_terms_map[keyword] = search_term 
-        # --- END MODIFIED ---
+        sql_filter = " OR ".join(sql_query_parts)
+        initial_query = f"SELECT * FROM links WHERE keyword_match IS NOT NULL AND keyword_match != '' AND ({sql_filter})"
 
-        # Find the index of the 'page_data' column
+        if os.path.exists(new_db_path): 
+            os.remove(new_db_path)
+            
+        new_conn = sqlite3.connect(new_db_path)
+        inserted_count = 0
+        rows_processed = 0 
+        batch_size = 500
+        insert_batch = []
+        
+        if total_rows_to_check == -1:
+            try:
+                temp_conn = sqlite3.connect(self.db_path)
+                temp_conn.create_function("REGEXP", 2, sqlite_regexp)
+                cursor = temp_conn.execute(f"SELECT COUNT(*) FROM links WHERE keyword_match IS NOT NULL AND keyword_match != '' AND ({sql_filter})", sql_query_values)
+                total_rows_to_check = cursor.fetchone()[0]
+                temp_conn.close()
+            except Exception as e:
+                logging.error(f"Failed to get keyword match count: {e}")
+                total_rows_to_check = 0
+            
+            if total_rows_to_check == 0:
+                if progress_signal: progress_signal.emit(100)
+                return 0
+            
+            if progress_signal:
+                logging.info(f"Total count calculated: {total_rows_to_check}. Starting streaming...")
+                progress_signal.emit(0) 
+
         try:
-            page_data_index = columns.index('page_data')
-        except ValueError:
-            logging.error("Database table missing 'page_data' column. Cannot perform threshold check.")
-            return columns, []
+            temp_conn = sqlite3.connect(self.db_path)
+            temp_conn.row_factory = sqlite3.Row 
+            temp_conn.create_function("REGEXP", 2, sqlite_regexp)
+            cursor = temp_conn.cursor()
+            
+            cursor.execute(initial_query, sql_query_values)
+            
+            original_columns = [description[0] for description in cursor.description]
+            columns_to_insert = [col for col in original_columns if col.lower() != 'id']
+            
+            with new_conn:
+                # --- FIX: Create table with correct schema ---
+                schema_string = self._build_create_table_schema(columns_to_insert)
+                new_conn.execute(f"CREATE TABLE links ({schema_string})")
+                # --- END FIX ---
+                
+                placeholders = ", ".join(["?"] * len(columns_to_insert))
+                insert_sql = f"INSERT INTO links ({', '.join(columns_to_insert)}) VALUES ({placeholders})"
+            
+            for row in cursor:
+                row_tuple = tuple(row[col] for col in columns_to_insert)
+                keyword_match_string = row['keyword_match']
+                
+                unique_match_count = 0
+                if keyword_match_string:
+                    stored_matches_set = {k.strip().lower() for k in keyword_match_string.split(',')}
+                    common_plain_matches = stored_matches_set.intersection(input_keywords_plain)
+                    unique_match_count += len(common_plain_matches)
+                    stored_regex_matches = {k.strip() for k in keyword_match_string.split(',') if k.strip().startswith("REGEX: ")}
+                    
+                    for input_regex_str, _ in input_keywords_regex:
+                        if input_regex_str in stored_regex_matches:
+                            unique_match_count += 1
+                
+                rows_processed += 1
+                if progress_signal and total_rows_to_check > 0 and rows_processed % 20 == 0: 
+                    percentage = int((rows_processed / total_rows_to_check) * 100)
+                    progress_signal.emit(percentage)
+                
+                if unique_match_count >= threshold:
+                    insert_batch.append(row_tuple)
+                    
+                    if len(insert_batch) >= batch_size:
+                        with new_conn:
+                            new_conn.executemany(insert_sql, insert_batch)
+                        inserted_count += len(insert_batch)
+                        insert_batch = [] 
 
-        filtered_rows = []
-        for row_tuple in initial_rows:
-            page_data = row_tuple[page_data_index]
-            
-            if not page_data:
-                continue
+            if insert_batch:
+                with new_conn:
+                    new_conn.executemany(insert_sql, insert_batch)
+                inserted_count += len(insert_batch)
 
-            page_data_lower = str(page_data).lower()
-            # Pad the page data for reliable matching (crucial consistency!)
-            page_data_padded = f" {page_data_lower} " 
-            
-            unique_matches = set()
-            
-            for original_keyword, search_term in search_terms_map.items():
-                if search_term in page_data_padded:
-                    unique_matches.add(original_keyword)
-            
-            # Apply the threshold
-            if len(unique_matches) >= threshold:
-                filtered_rows.append(row_tuple)
+        except Exception as e:
+            logging.error(f"Error during streaming keyword matching: {e}\n{traceback.format_exc()}")
+            return -1
+        finally:
+            if 'temp_conn' in locals():
+                temp_conn.close()
+            if 'new_conn' in locals():
+                new_conn.close()
 
-        logging.info(f"Found {len(filtered_rows)} links meeting the threshold of {threshold} unique matches.")
-        return columns, filtered_rows
+        if progress_signal:
+            progress_signal.emit(100)
+
+        logging.info(f"Found and saved {inserted_count} links meeting the threshold of {threshold} unique matches to {new_db_path}.")
+        return inserted_count
         
-        
+    def add_links(self, links, add_top_level_too=False):
+        normalized_links_input = {link.rstrip('/') for link in links if not is_junk_url(link)}
+
+        links_to_add = []
+        if add_top_level_too:
+            processed_links = set()
+            for link in normalized_links_input:
+                if link not in processed_links:
+                    links_to_add.append((link,))
+                    processed_links.add(link)
+                top_level = get_top_level_url(link) 
+                if top_level and top_level not in processed_links:
+                     links_to_add.append((top_level,))
+                     processed_links.add(top_level)
+        else:
+            links_to_add = [(link,) for link in normalized_links_input]
+
+        if links_to_add:
+            with self.conn:
+                self.conn.row_factory = None # Ensure default
+                self.conn.executemany("INSERT OR IGNORE INTO links (url) VALUES (?)", links_to_add)
+
     def update_links_batch(self, update_data):
-        """
-        Updates a batch of links with status, title, keyword, and page data.
-        Expects a list of tuples: [(status, title, keyword_match, page_data, url), ...]
-        """
         if not update_data:
             return
         with self.conn:
+            self.conn.row_factory = None # Ensure default
             self.conn.executemany("UPDATE links SET scraped = ?, title = ?, keyword_match = ?, page_data = ? WHERE url = ?", update_data)
             
     def update_titles_batch(self, update_data):
-        """
-        Updates only the titles for a batch of links, leaving the scraped status unchanged.
-        Expects a list of tuples: [(title, url), ...]
-        """
         if not update_data:
             return
         with self.conn:
+            self.conn.row_factory = None # Ensure default
             self.conn.executemany("UPDATE links SET title = ? WHERE url = ?", update_data)
 
     def reset_failed_links(self):
-        """Resets all failed links back to unscraped (status 0) for a retry."""
         with self.conn:
+            self.conn.row_factory = None # Ensure default
             self.conn.execute("UPDATE links SET scraped = 0 WHERE scraped = 2")
 
     def reset_links_missing_page_data(self):
-        """Resets all non-failed links missing page data back to unscraped (status 0)."""
         with self.conn:
+            self.conn.row_factory = None # Ensure default
             self.conn.execute("UPDATE links SET scraped = 0 WHERE scraped != 2 AND (page_data IS NULL OR page_data = '')")
 
     def get_total_link_count(self):
-        """Gets the total number of unique links in the database."""
         with self.conn:
+            self.conn.row_factory = None # Ensure default
             return self.conn.execute("SELECT COUNT(*) FROM links").fetchone()[0]
 
-    def pull_top_level_to_new_db(self, new_db_path):
-        """Pulls all top-level URLs into a new database file, handling schema differences."""
-        all_links_rows = []
-        source_column_names = []
-        with self.conn:
-            cursor = self.conn.execute("SELECT * FROM links")
-            all_links_rows = cursor.fetchall()
-            # Get column names from the source database
-            source_column_names = [desc[0].lower() for desc in cursor.description]
+    def pull_top_level_to_new_db(self, new_db_path, progress_signal=None, total_rows_to_check=-1): 
+        COLUMNS_TO_INSERT = ['url', 'scraped', 'title', 'keyword_match', 'page_data']
+        
+        inserted_count = 0
+        rows_processed = 0 
+        batch_size = 500
+        insert_batch = []
+        
+        if os.path.exists(new_db_path):
+            os.remove(new_db_path)
 
-        top_level_rows_to_insert = []
-        for row_tuple in all_links_rows:
-            # Create a dictionary for easy, safe access by column name
-            row_dict = dict(zip(source_column_names, row_tuple))
-            url = row_dict.get('url')
+        new_conn = sqlite3.connect(new_db_path)
+        
+        if total_rows_to_check == -1:
+            temp_db_mgr = DatabaseManager(self.db_path)
+            total_rows_to_check = temp_db_mgr.get_total_link_count()
+            temp_db_mgr.close()
             
-            # Check if it's a top-level URL
-            if url and get_top_level_url(url) == url:
-                # Build a new tuple for insertion, explicitly mapping columns
-                # This safely handles source DBs that don't have the new columns
-                new_row_tuple = (
-                    row_dict.get('id'),
-                    row_dict.get('url'),
-                    row_dict.get('scraped', 0),
-                    row_dict.get('title'),
-                    row_dict.get('keyword_match'), # Will be None if column doesn't exist in source
-                    row_dict.get('page_data')      # Will be None if column doesn't exist in source
-                )
-                top_level_rows_to_insert.append(new_row_tuple)
-
-        if not top_level_rows_to_insert:
-            logging.info("No top-level URLs found to pull.")
-            return 0 # Indicate that no URLs were found
-
+            if total_rows_to_check == 0:
+                if progress_signal: progress_signal.emit(100)
+                return 0
+            
+            if progress_signal:
+                logging.info(f"Total count calculated: {total_rows_to_check}. Starting streaming...")
+                progress_signal.emit(0) 
+        
         try:
-            new_conn = sqlite3.connect(new_db_path)
+            temp_conn = sqlite3.connect(self.db_path)
+            temp_conn.row_factory = sqlite3.Row 
+            cursor = temp_conn.cursor()
+            
+            cursor.execute("SELECT * FROM links")
+            
+            columns = [desc[0].lower() for desc in cursor.description]
+            column_indices = {name: columns.index(name) for name in COLUMNS_TO_INSERT if name in columns}
+            url_index = column_indices.get('url')
+            
+            if url_index is None:
+                logging.error("Database table missing 'url' column. Cannot pull top-level URLs.")
+                return -1
+
             with new_conn:
-                # Create the new table with the full, current schema
-                new_conn.execute("""
-                    CREATE TABLE IF NOT EXISTS links (
-                        id INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL,
-                        scraped INTEGER DEFAULT 0, title TEXT,
-                        keyword_match TEXT, page_data TEXT )""")
-                # Insert the prepared tuples
-                new_conn.executemany("INSERT OR IGNORE INTO links (id, url, scraped, title, keyword_match, page_data) VALUES (?, ?, ?, ?, ?, ?)", top_level_rows_to_insert)
-            new_conn.close()
-            logging.info(f"Successfully pulled {len(top_level_rows_to_insert)} top-level URLs to {new_db_path}")
-            return len(top_level_rows_to_insert)
+                # --- FIX: Create table with correct schema ---
+                schema_string = self._build_create_table_schema(COLUMNS_TO_INSERT)
+                new_conn.execute(f"CREATE TABLE links ({schema_string})")
+                # --- END FIX ---
+                
+                placeholders = ", ".join(["?"] * len(COLUMNS_TO_INSERT))
+                insert_sql = f"INSERT OR IGNORE INTO links ({', '.join(COLUMNS_TO_INSERT)}) VALUES ({placeholders})"
+
+            for row in cursor:
+                url = row[url_index]
+                
+                if url and get_top_level_url(url) == url:
+                    new_row_tuple = tuple(row[column_indices.get(col)] if col in column_indices else None for col in COLUMNS_TO_INSERT)
+                    insert_batch.append(new_row_tuple)
+                    
+                rows_processed += 1
+                if progress_signal and total_rows_to_check > 0 and rows_processed % 20 == 0:
+                    percentage = int((rows_processed / total_rows_to_check) * 100)
+                    progress_signal.emit(percentage)
+
+                if len(insert_batch) >= batch_size:
+                    with new_conn:
+                        new_conn.executemany(insert_sql, insert_batch)
+                    inserted_count += len(insert_batch)
+                    insert_batch = []
+            
+            if insert_batch:
+                with new_conn:
+                    new_conn.executemany(insert_sql, insert_batch)
+                inserted_count += len(insert_batch)
+
         except Exception as e:
-            logging.error(f"Failed to create top-level DB: {e}")
-            return -1 # Indicate an error occurred
+            logging.error(f"Error during streaming top-level URL pull: {e}\n{traceback.format_exc()}")
+            return -1
+        finally:
+            if 'temp_conn' in locals():
+                temp_conn.close()
+            if 'new_conn' in locals():
+                new_conn.close()
+
+        if progress_signal:
+            progress_signal.emit(100)
+            
+        logging.info(f"Successfully pulled {inserted_count} top-level URLs to {new_db_path}")
+        return inserted_count
 
     def close(self):
         """Closes the database connection."""
