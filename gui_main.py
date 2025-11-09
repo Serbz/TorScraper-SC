@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QGroupBox, QLabel, QLineEdit,
                                QPushButton, QTextEdit, QMessageBox, QFileDialog, QDialog, QCheckBox,
                                QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QMenu,
-                               QTableView, QInputDialog, QProgressDialog)
+                               QTableView, QInputDialog, QProgressDialog, QComboBox) # <-- Import QComboBox
 from PySide6.QtCore import (QObject, Signal, QThread, Qt, QAbstractTableModel, 
                             QModelIndex, QTimer) 
 from PySide6.QtGui import QColor, QTextCursor, QFont, QAction
@@ -281,15 +281,28 @@ class ScraperApp(QMainWindow):
         checkbox_layout = QHBoxLayout()
         self.top_level_checkbox = QCheckBox("Scrape Top-Level URLs Only")
         self.titles_only_checkbox = QCheckBox("Scrape Titles Only")
-        self.save_page_data_checkbox = QCheckBox("Save page data")
-        self.save_page_data_checkbox.setToolTip("If unchecked, page data is only saved if a keyword matches.")
         
-        checkbox_layout.addStretch()
+        # --- NEW: Save Page Data Dropdown ---
+        save_data_layout = QHBoxLayout()
+        save_data_label = QLabel("Save Page Data:")
+        self.save_page_data_dropdown = QComboBox()
+        self.save_page_data_dropdown.addItems(["All", "Keyword Match", "None"])
+        self.save_page_data_dropdown.setToolTip(
+            "All: Saves full text of every page.\n"
+            "Keyword Match: Saves full text ONLY if a keyword matches.\n"
+            "None: Never saves full text."
+        )
+        save_data_layout.addWidget(save_data_label)
+        save_data_layout.addWidget(self.save_page_data_dropdown)
+        # --- END NEW ---
 
+        checkbox_layout.addStretch()
         checkbox_layout.addWidget(self.top_level_checkbox)
         checkbox_layout.addWidget(self.titles_only_checkbox)
-        checkbox_layout.addWidget(self.save_page_data_checkbox)
         checkbox_layout.addStretch()
+        checkbox_layout.addLayout(save_data_layout) # Add dropdown layout
+        checkbox_layout.addStretch()
+        
         param_layout.addLayout(checkbox_layout)
 
         param_group.setLayout(param_layout)
@@ -815,7 +828,7 @@ class ScraperApp(QMainWindow):
             'top_level_only': self.top_level_checkbox.isChecked(),
             'titles_only': self.titles_only_checkbox.isChecked(),
             'keyword_search': self.keyword_checkbox.isChecked(),
-            'save_page_data': self.save_page_data_checkbox.isChecked(),
+            'save_page_data': self.save_page_data_dropdown.currentText(), # <-- Changed
             'url_file': self.url_file_path,
             'keyword_file': self.keyword_file_path,
             'overwrite_torrc_auto': self.overwrite_torrc_auto
@@ -831,7 +844,14 @@ class ScraperApp(QMainWindow):
         self.top_level_checkbox.setChecked(params['top_level_only'])
         self.titles_only_checkbox.setChecked(params['titles_only'])
         self.keyword_checkbox.setChecked(params['keyword_search'])
-        self.save_page_data_checkbox.setChecked(params['save_page_data'])
+        
+        # --- Load Save Page Data Dropdown ---
+        save_mode = params.get('save_page_data', 'Keyword Match')
+        if save_mode not in ["All", "Keyword Match", "None"]:
+            save_mode = "Keyword Match" # Default
+        self.save_page_data_dropdown.setCurrentText(save_mode)
+        # --- End Load ---
+
         self.url_file_path = params['url_file']
         if self.url_file_path:
             self.url_file_display.setText(self.url_file_path)
@@ -957,13 +977,13 @@ class ScraperApp(QMainWindow):
         with self.active_tasks_lock:
             self.active_tasks_dict.clear()
         
-        save_all_page_data = self.save_page_data_checkbox.isChecked()
+        save_page_data_mode = self.save_page_data_dropdown.currentText() # <-- Changed
         
         args = argparse.Namespace(
             urls=urls, 
             db_file=self.entries['db_file'].text(), 
-            batch_size=batch_size,
-            save_all_page_data=save_all_page_data
+            batch_size=batch_size
+            # save_all_page_data is no longer needed here
         )
         
         onion_only_mode = self.onion_only_checkbox.isChecked()
@@ -974,7 +994,7 @@ class ScraperApp(QMainWindow):
             args, self.stop_event, self.pause_event, 
             self.active_tasks_dict, self.active_tasks_lock, 
             rescrape_mode, top_level_only_mode, onion_only_mode, 
-            titles_only_mode, keywords, save_all_page_data,
+            titles_only_mode, keywords, save_page_data_mode, # <-- Pass mode string
             rescrape_page_data_mode
         )
         
