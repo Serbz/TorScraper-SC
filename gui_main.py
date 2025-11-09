@@ -15,6 +15,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 import logging
+import importlib.util # <-- ADDED for Nyx check
 
 # --- PySide6 Import Fix ---
 try:
@@ -101,6 +102,12 @@ class ScraperApp(QMainWindow):
         self.setup_logging() 
         
         self.load_parameters() 
+
+        # --- NYX CHECK ---
+        # Run this check *before* Npcap, as it's less critical
+        # and doesn't require an app restart.
+        self.check_and_install_nyx()
+        # --- END NYX CHECK ---
 
         if not check_and_install_npcap(self.script_dir, self):
              QMessageBox.critical(self, "Npcap Required",
@@ -341,11 +348,19 @@ class ScraperApp(QMainWindow):
         self.reload_button = QPushButton("Reload Script")
         self.reload_button.clicked.connect(self.reload_script)
         
+        # --- NYX BUTTON ---
+        self.nyx_button = QPushButton("Run Nyx")
+        self.nyx_button.clicked.connect(self.launch_nyx)
+        self.nyx_button.setToolTip("Launches the 'nyx' Tor monitor in a new terminal.")
+        self.nyx_button.setEnabled(False) # Will be enabled if found
+        # --- END NYX BUTTON ---
+        
         self.help_button = QPushButton("Help")
         self.help_button.clicked.connect(self.open_help_dialog)
 
-        # New layout order: Network, Stretch, Reload, New Identity, Help
+        # New layout order: Network, Stretch, Reload, Nyx, New Identity, Help
         bottom_button_layout.addWidget(self.reload_button)
+        bottom_button_layout.addWidget(self.nyx_button)
         bottom_button_layout.addWidget(self.new_identity_button)
         bottom_button_layout.addWidget(self.help_button)
         # --- END FIX ---
@@ -354,6 +369,55 @@ class ScraperApp(QMainWindow):
         main_layout.addLayout(start_button_layout)
         main_layout.addLayout(log_panes_layout)
         main_layout.addLayout(bottom_button_layout)
+
+    # --- NYX LAUNCH AND CHECK METHODS ---
+    def launch_nyx(self):
+        """Launches nyx in a new terminal window."""
+        logging.info("Attempting to launch 'nyx'...")
+        if sys.platform == "win32":
+            # Use 'start' to open a new console window and run 'nyx'
+            # The '/c' switch makes the new cmd window run the command and then close
+            os.system('start cmd /c "nyx"') 
+        else:
+            # Basic support for linux/mac
+            try:
+                # Try to find a default terminal emulator
+                subprocess.Popen(['x-terminal-emulator', '-e', 'nyx'])
+            except Exception:
+                logging.error("Failed to launch terminal. Please run 'nyx' manually.")
+
+    def check_and_install_nyx(self):
+        """Checks if nyx is installed and prompts to install if not."""
+        if importlib.util.find_spec('nyx') is None:
+            logging.warning("Python 'nyx' package not found.")
+            self.nyx_button.setEnabled(False)
+            
+            reply = QMessageBox.information(self, "Nyx Monitor Not Found",
+                                          "The 'nyx' Tor monitor is not installed.\n\n"
+                                          "Nyx is an optional (but recommended) tool for advanced monitoring of your Tor connection.\n\n"
+                                          "Would you like to install it now? (This will open a PowerShell window to run the installer).",
+                                          QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            
+            if reply == QMessageBox.Yes:
+                try:
+                    # --- FIX: Import from InstallNyx.py ---
+                    from InstallNyx import install_nyx
+                    logging.info("Running Nyx installer...")
+                    install_nyx()
+                    QMessageBox.information(self, "Installation Started",
+                                              "The Nyx installation is running in a new PowerShell window.\n\n"
+                                              "After it completes, please restart this application to enable the 'Run Nyx' button.")
+                except ImportError:
+                    logging.error("Could not find InstallNyx.py to start installation.")
+                    QMessageBox.critical(self, "Error", "Could not find InstallNyx.py")
+                    # --- END FIX ---
+                except Exception as e:
+                    logging.error(f"Failed to start Nyx installation: {e}")
+                    QMessageBox.critical(self, "Error", f"Failed to start Nyx installation: {e}")
+        else:
+            logging.info("'nyx' package found. Enabling button.")
+            self.nyx_button.setEnabled(True)
+    # --- END NYX METHODS ---
 
     def on_tor_ready(self):
         """Slot to enable controls once Tor has bootstrapped."""
@@ -922,21 +986,31 @@ class ScraperApp(QMainWindow):
 
     def stop_scraping(self):
         logging.warning("[WARN] Stop button clicked. Requesting scraper to stop...")
+        
+        # --- REVAMPED STOP LOGIC ---
+        # 1. Set the "polite" stop event first.
+        # This tells any workers that are *not* stuck to skip their DB write.
         self.stop_event.set()
+        
+        # 2. Clear the pause event, if it's set
         self.pause_event.clear() 
+        
+        # 3. Disable the stop button
         self.stop_button.setEnabled(False)
         
-        # --- FIX (Request 1): Removed manual call to on_scraping_finished ---
-        # This was causing a race condition. The 'finished' signal
-        # from the thread itself will now handle re-enabling controls.
-        # --- END FIX ---
+        # 4. Call the "forceful" stop on the thread.
+        # This will inject a shutdown command into the thread's event loop.
+        if self.scraper_thread:
+            self.scraper_thread.stop_now()
+        # --- END REVAMPED LOGIC ---
 
     def on_scraping_finished(self):
+        logging.info("Scraping finished. Re-enabling controls.")
         self.start_button.setEnabled(True)
         self.rescape_action.setEnabled(True)
         self.rescrape_data_action.setEnabled(True)
         self.stop_button.setEnabled(False)
         
         # Set the thread attribute to None so a new one can be started.
-        # This "releases" the old thread, even if it's zombied.
+        # This "releases" the old thread.
         self.scraper_thread = None
