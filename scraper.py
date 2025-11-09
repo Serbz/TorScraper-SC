@@ -377,9 +377,15 @@ async def scraper_main_producer(queue, args, stop_event,
             if not failed_links:
                 logging.info("[INFO] No failed links found to rescrape.")
             else:
-                logging.info(f"Found {len(failed_links)} failed links. Resetting and retrying...")
-                db.reset_failed_links()
+                logging.info(f"Found {len(failed_links)} failed links. Adding to queue...")
+                # --- FIX: Removed db.reset_failed_links() ---
+                # We will not reset the links to 0. The worker will
+                # pull a '2' and update it to '1' or keep it '2'.
+                # logging.info(f"Found {len(failed_links)} failed links. Resetting and retrying...")
+                # db.reset_failed_links() # <-- REMOVED
+                # --- END FIX ---
                 links_to_process = failed_links
+                
                 if onion_only_mode:
                     links_to_process = [link for link in failed_links if urlparse(link).netloc.endswith('.onion')]
                 
