@@ -15,7 +15,7 @@ import json
 import logging
 import sqlite3
 import binascii
-import re
+import re # <-- Already imported
 import shutil
 import importlib.util # <-- ADDED for robust package checking
 from datetime import datetime
@@ -59,6 +59,24 @@ def get_script_dir():
 # Define script directory globally for other modules to import
 SCRIPT_DIR = get_script_dir()
 
+# --- FIX: Regex for filtering junk URLs ---
+# This looks for any single character (like 'a' or '7') repeated 8 or more times
+JUNK_URL_REGEX = re.compile(r'(.)\1{7,}')
+# --- END FIX ---
+
+def is_junk_url(url):
+    """Checks if a URL is likely junk based on repetitive characters in the domain."""
+    if not url:
+        return False
+    try:
+        # We only check the domain part (netloc) for the repetitive pattern
+        netloc = urlparse(url).netloc
+        if JUNK_URL_REGEX.search(netloc):
+            return True
+    except Exception:
+        return False # Fail-safe on malformed URLs
+    return False
+
 def get_top_level_url(url):
     """Extracts the scheme and netloc to get the base URL and normalizes it."""
     try:
@@ -83,6 +101,12 @@ def extract_urls_from_text(text):
     # Add http:// to www links that are missing it
     normalized_urls = [f"http://{url}" if url.startswith('www.') else url for url in found_urls]
     return list(set(normalized_urls)) # Return unique URLs
+
+# --- MODE Constants (Moved from gui_components.py) ---
+MODE_PAGINATE = 0
+MODE_PULL_TOP_LEVEL = 1
+MODE_PULL_KEYWORDS = 2
+# --- END MODE Constants ---
 
 # --- Scraper Constants ---
 PROXIES = [
