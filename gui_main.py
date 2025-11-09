@@ -280,7 +280,7 @@ class ScraperApp(QMainWindow):
         
         checkbox_layout = QHBoxLayout()
         self.top_level_checkbox = QCheckBox("Scrape Top-Level URLs Only")
-        self.titles_only_checkbox = QCheckBox("Scrape Titles Only")
+        self.titles_only_checkbox = QCheckBox("Scrape Titles Only (Existing Links Only)")
         
         # --- NEW: Save Page Data Dropdown ---
         save_data_layout = QHBoxLayout()
