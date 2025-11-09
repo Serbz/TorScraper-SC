@@ -467,7 +467,8 @@ class ScraperWorker(QThread):
     def __init__(self, args, stop_event, pause_event, 
                  active_tasks_dict, active_tasks_lock, 
                  rescrape_mode=False, top_level_only_mode=False, 
-                 onion_only_mode=False, titles_only_mode=False, keywords=None, save_all_page_data=False,
+                 onion_only_mode=False, titles_only_mode=False, keywords=None, 
+                 save_page_data_mode="Keyword Match", # <-- Changed
                  rescrape_page_data_mode=False): 
         super().__init__()
         self.args = args
@@ -480,7 +481,7 @@ class ScraperWorker(QThread):
         self.onion_only_mode = onion_only_mode
         self.titles_only_mode = titles_only_mode
         self.keywords = keywords
-        self.save_all_page_data = save_all_page_data
+        self.save_page_data_mode = save_page_data_mode # <-- Changed
         self.rescrape_page_data_mode = rescrape_page_data_mode 
         
         # --- REVAMP: Attributes to hold the loop and tasks ---
@@ -544,7 +545,7 @@ class ScraperWorker(QThread):
                     worker_id, queue, self.stop_event, self.pause_event, 
                     self.active_tasks_dict, self.active_tasks_lock,
                     self.onion_only_mode, self.titles_only_mode,
-                    self.keywords, self.save_all_page_data,
+                    self.keywords, self.save_page_data_mode, # <-- Pass mode string
                     self.top_level_only_mode 
                 ))
                 self.worker_tasks.append(task)
@@ -555,6 +556,7 @@ class ScraperWorker(QThread):
                 self.rescrape_mode, self.top_level_only_mode,
                 self.onion_only_mode, self.titles_only_mode,
                 self.keywords, 
+                self.save_page_data_mode, # <-- Pass mode string
                 self.rescrape_page_data_mode 
             ))
             
