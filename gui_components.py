@@ -521,7 +521,13 @@ class ScraperWorker(QThread):
             for task in worker_tasks:
                 task.cancel() 
             
-            await asyncio.gather(*worker_tasks, return_exceptions=True)
+            # --- FIX: Do not await the tasks if a stop was requested ---
+            # Awaiting them is what causes the 10-minute hang, as curl_cffi
+            # does not honor the cancellation. We just need the thread
+            # to finish so the GUI can be re-enabled.
+            if not self.stop_event.is_set():
+                await asyncio.gather(*worker_tasks, return_exceptions=True)
+            # --- END FIX ---
 
             logging.info("Scraper workers shut down complete. Emitting finished signal.")
 
