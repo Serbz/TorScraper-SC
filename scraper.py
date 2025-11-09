@@ -260,13 +260,15 @@ async def scraper_worker_task(worker_id, queue, stop_event, pause_event,
                         elif matching_keyword:
                             page_data_to_save = page_text 
                         
+                        # --- BUG FIX: titles_only_mode must also set status=1 ---
                         if titles_only_mode:
-                            # We can update here, as it's a lighter operation
-                            db.update_titles_batch([(title_to_save, url)])
+                            # db.update_titles_batch([(title_to_save, url)]) # <-- OLD
                             status = 1 # Mark as success
-                            continue # Skip the main DB update logic
+                            # We still `continue` to skip the main DB logic
+                            # The 'finally' block will now handle the DB update
                         else:
                             status = 1 # Full scrape success
+                        # --- END BUG FIX ---
                     
                     except Exception as e:
                         logging.error(f"[{worker_id}] Error parsing content from {url}: {e}")
@@ -304,17 +306,11 @@ async def scraper_worker_task(worker_id, queue, stop_event, pause_event,
                     try:
                         if db and url: # Ensure we have a DB and URL to update
                             
+                            # --- BUG FIX: titles_only_mode now updates status ---
                             if titles_only_mode:
-                                # If titles_only was successful, we `continue`d earlier.
-                                # If we are here, it's either a success that needs
-                                # its status=1 marked, OR a failure.
-                                # A simple title update is all that's needed.
-                                if status == 1: # Success
-                                    # This should have been caught by the `continue`
-                                    # but we'll be safe.
-                                    db.update_titles_batch([(title_to_save, url)])
-                                else: # Failure
-                                    db.update_titles_batch([(title_to_save, url)])
+                                # This now correctly updates status AND title
+                                db.update_status_and_title_batch([(status, title_to_save, url)])
+                            # --- END BUG FIX ---
                             
                             else:
                                 # This is the main update for full-scrape mode (success or fail)
