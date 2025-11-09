@@ -456,7 +456,12 @@ class QLogHandler(logging.Handler, QObject):
         self.log_received.emit(record)
 
 class ScraperWorker(QThread):
-    """A QThread to run the asyncio scraper logic without blocking the GUI."""
+    """
+    A QThread to run the asyncio scraper logic without blocking the GUI.
+    
+    This thread's *only* job is to create and run an asyncio event loop.
+    The main GUI thread can then schedule a forceful shutdown on this loop.
+    """
     finished = Signal()
     
     def __init__(self, args, stop_event, pause_event, 
@@ -477,66 +482,92 @@ class ScraperWorker(QThread):
         self.keywords = keywords
         self.save_all_page_data = save_all_page_data
         self.rescrape_page_data_mode = rescrape_page_data_mode 
+        
+        # --- REVAMP: Attributes to hold the loop and tasks ---
+        self.loop = None
+        self.producer_task = None
+        self.worker_tasks = []
+        # --- END REVAMP ---
     
-    async def run_async_logic(self):
-        """Sets up the producer-consumer model and runs it."""
+    async def _shutdown_tasks(self):
+        """
+        A coroutine that forcefully cancels all running tasks and stops the loop.
+        This is designed to be called thread-safe from the GUI.
+        """
+        logging.warning("Forceful shutdown initiated. Cancelling all tasks...")
         
-        concurrency = self.args.batch_size
-        queue = asyncio.Queue(maxsize=concurrency * 2)
+        if self.producer_task:
+            self.producer_task.cancel()
+            
+        for task in self.worker_tasks:
+            task.cancel()
+            
+        # Wait for all tasks to acknowledge cancellation
+        all_tasks = self.worker_tasks + [self.producer_task]
+        await asyncio.gather(*[t for t in all_tasks if t], return_exceptions=True)
         
-        worker_tasks = []
-        for i in range(concurrency):
-            worker_id = f"Worker-{i+1}" 
-            worker_tasks.append(asyncio.create_task(scraper_worker_task(
-                worker_id, queue, self.stop_event, self.pause_event, 
-                self.active_tasks_dict, self.active_tasks_lock,
-                self.onion_only_mode, self.titles_only_mode,
-                self.keywords, self.save_all_page_data,
-                self.top_level_only_mode 
-            )))
-            
-        producer_task = asyncio.create_task(scraper_main_producer(
-            queue, self.args, self.stop_event,
-            self.rescrape_mode, self.top_level_only_mode,
-            self.onion_only_mode, self.titles_only_mode,
-            self.keywords, 
-            self.rescrape_page_data_mode 
-        ))
+        if self.loop:
+            self.loop.stop()
+        logging.warning("Event loop stopped.")
 
-        try:
-            await producer_task
-            
-            if self.stop_event.is_set():
-                logging.warning("Stop requested. Bypassing queue.join() to cancel workers.")
-            else:
-                logging.info("Producer finished. Waiting for workers to drain queue...")
-                await queue.join()
-                logging.info("Queue empty. All tasks processed.")
-
-        except Exception as e:
-            logging.error(f"Error in async manager: {e}\n{traceback.format_exc()}")
-        
-        finally:
-            logging.info("Cancelling worker tasks...")
-            for task in worker_tasks:
-                task.cancel() 
-            
-            # --- FIX: Do not await the tasks if a stop was requested ---
-            # Awaiting them is what causes the 10-minute hang, as curl_cffi
-            # does not honor the cancellation. We just need the thread
-            # to finish so the GUI can be re-enabled.
-            if not self.stop_event.is_set():
-                await asyncio.gather(*worker_tasks, return_exceptions=True)
-            # --- END FIX ---
-
-            logging.info("Scraper workers shut down complete. Emitting finished signal.")
+    def stop_now(self):
+        """
+        Public, thread-safe method for the GUI to call.
+        It schedules the _shutdown_tasks coroutine on the running event loop.
+        """
+        if self.loop and self.loop.is_running():
+            logging.info("Scheduling forceful shutdown from main thread...")
+            asyncio.run_coroutine_threadsafe(self._shutdown_tasks(), self.loop)
+        else:
+            logging.warning("Stop_now called, but loop is not running.")
 
     def run(self):
+        """
+        This is the entry point for the QThread.
+        It sets up and runs the asyncio event loop.
+        """
         try:
+            # --- REVAMP: Create and manage the loop directly ---
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+
             if sys.platform == "win32":
                 asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            asyncio.run(self.run_async_logic())
+            
+            concurrency = self.args.batch_size
+            queue = asyncio.Queue(maxsize=concurrency * 2)
+            
+            # Create worker tasks
+            for i in range(concurrency):
+                worker_id = f"Worker-{i+1}" 
+                task = self.loop.create_task(scraper_worker_task(
+                    worker_id, queue, self.stop_event, self.pause_event, 
+                    self.active_tasks_dict, self.active_tasks_lock,
+                    self.onion_only_mode, self.titles_only_mode,
+                    self.keywords, self.save_all_page_data,
+                    self.top_level_only_mode 
+                ))
+                self.worker_tasks.append(task)
+            
+            # Create producer task
+            self.producer_task = self.loop.create_task(scraper_main_producer(
+                queue, self.args, self.stop_event,
+                self.rescrape_mode, self.top_level_only_mode,
+                self.onion_only_mode, self.titles_only_mode,
+                self.keywords, 
+                self.rescrape_page_data_mode 
+            ))
+            
+            # Run the loop until stop() is called
+            logging.info("Scraper event loop started.")
+            self.loop.run_forever()
+            
+            # --- END REVAMP ---
+
         except Exception as e:
             logging.error(f"[ERROR] Scraper thread error: {e}\n{traceback.format_exc()}")
         finally:
+            if self.loop:
+                self.loop.close()
+            logging.info("Scraper thread finished. Emitting finished signal.")
             self.finished.emit()
