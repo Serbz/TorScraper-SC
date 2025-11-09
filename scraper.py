@@ -183,7 +183,7 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
 async def scraper_worker_task(worker_id, queue, stop_event, pause_event, 
                             active_tasks_dict, active_tasks_lock, 
                             onion_only_mode, titles_only_mode, 
-                            keywords, save_all_page_data,
+                            keywords, save_page_data_mode, # <-- Changed
                             top_level_only_mode):
     """
     A worker (consumer) that pulls a (db, url, task_id) tuple from the 
@@ -255,10 +255,13 @@ async def scraper_worker_task(worker_id, queue, stop_event, pause_event,
                                 active_tasks_dict[task_id]['title'] = title_to_save
                         # --- END FIX ---
                         
-                        if save_all_page_data:
+                        # --- Updated Save Page Data Logic ---
+                        if save_page_data_mode == "All":
                             page_data_to_save = page_text 
-                        elif matching_keyword:
-                            page_data_to_save = page_text 
+                        elif save_page_data_mode == "Keyword Match" and matching_keyword:
+                            page_data_to_save = page_text
+                        # If mode is "None", page_data_to_save remains None
+                        # --- End Updated Logic ---
                         
                         # --- BUG FIX: titles_only_mode must also set status=1 ---
                         if titles_only_mode:
@@ -342,6 +345,7 @@ async def scraper_worker_task(worker_id, queue, stop_event, pause_event,
 async def scraper_main_producer(queue, args, stop_event, 
                               rescrape_mode=False, top_level_only_mode=False, 
                               onion_only_mode=False, titles_only_mode=False, keywords=None,
+                              save_page_data_mode="Keyword Match", # <-- Changed
                               rescrape_page_data_mode=False): 
     """
     The main async function (PRODUCER) for the scraper logic.
@@ -362,8 +366,8 @@ async def scraper_main_producer(queue, args, stop_event,
         logging.info("[INFO] Starting in TITLES-ONLY scrape mode.")
     if keywords:
         logging.info(f"[INFO] Starting with {len(keywords)} keywords.")
-    if args.save_all_page_data: 
-        logging.info("[INFO] 'Save all page data' is ENABLED.")
+    
+    logging.info(f"[INFO] Save Page Data mode: {save_page_data_mode}") # <-- Changed
 
     processed_in_this_run = set()
 
