@@ -399,8 +399,15 @@ async def scraper_main_producer(queue, args, stop_event,
                             continue
                         # --- END FIX ---
                         task_id = f"{url}_{random.randint(10000, 99999)}"
-                        await queue.put((db, url, task_id))
-                        processed_in_this_run.add(url)
+                        # --- REVAMP: Use non-blocking queue.put ---
+                        while not stop_event.is_set():
+                            try:
+                                queue.put_nowait((db, url, task_id))
+                                processed_in_this_run.add(url)
+                                break # Put successful, move to next url
+                            except asyncio.QueueFull:
+                                await asyncio.sleep(0.5) # Poll
+                        # --- END REVAMP ---
         
         elif rescrape_page_data_mode:
             links_missing_data = db.get_links_missing_page_data()
@@ -423,8 +430,15 @@ async def scraper_main_producer(queue, args, stop_event,
                             continue
                         # --- END FIX ---
                         task_id = f"{url}_{random.randint(10000, 99999)}"
-                        await queue.put((db, url, task_id))
-                        processed_in_this_run.add(url)
+                        # --- REVAMP: Use non-blocking queue.put ---
+                        while not stop_event.is_set():
+                            try:
+                                queue.put_nowait((db, url, task_id))
+                                processed_in_this_run.add(url)
+                                break # Put successful, move to next url
+                            except asyncio.QueueFull:
+                                await asyncio.sleep(0.5) # Poll
+                        # --- END REVAMP ---
 
         else: # Normal or top-level scraping mode
             if args.urls:
@@ -481,15 +495,31 @@ async def scraper_main_producer(queue, args, stop_event,
                     # --- END FIX ---
                     
                     task_id = f"{url}_{random.randint(10000, 99999)}"
-                    await queue.put((db, url, task_id))
-                    processed_in_this_run.add(url)
+                    # --- REVAMP: Use non-blocking queue.put ---
+                    while not stop_event.is_set():
+                        try:
+                            queue.put_nowait((db, url, task_id))
+                            processed_in_this_run.add(url)
+                            break # Put successful, move to next url
+                        except asyncio.QueueFull:
+                            await asyncio.sleep(0.5) # Poll
+                    # --- END REVAMP ---
                 
                 if stop_event.is_set(): break
 
+                # --- FIX: Replaced await queue.join() with a polling loop ---
+                # This allows the producer to check the stop_event frequently
+                # instead of blocking until the entire queue is drained.
                 logging.info(f"--- Iteration {iteration_count} links queued. Waiting for queue to drain... ---")
-                await queue.join()
+                while not queue.empty():
+                    if stop_event.is_set():
+                        logging.warning("Stop detected during queue drain. Breaking producer loop.")
+                        break
+                    await asyncio.sleep(1) # Poll every second
                 
                 if stop_event.is_set(): break
+                # await queue.join() # <-- REMOVED BLOCKING CALL
+                # --- END FIX ---
 
                 logging.info(f"--- Iteration {iteration_count} queue drained. Checking for new links. ---")
                 
@@ -497,6 +527,8 @@ async def scraper_main_producer(queue, args, stop_event,
                     logging.info("[INFO] Titles-Only mode complete. Stopping producer.")
                     break 
             
+    except asyncio.CancelledError:
+        logging.info("Producer task was cancelled.")
     except Exception as e:
         logging.error(f"Error in scraper producer: {e}\n{traceback.format_exc()}")
     finally:
