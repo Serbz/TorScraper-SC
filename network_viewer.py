@@ -211,8 +211,11 @@ class NetworkActivityViewer(QDialog):
         finished_group.setLayout(finished_layout)
         # --- END FIX ---
 
-        tables_layout.addWidget(active_group)
-        tables_layout.addWidget(finished_group)
+        # --- FIX: Set stretch factors for a 40/60 split ---
+        tables_layout.addWidget(active_group, 4) # 40%
+        tables_layout.addWidget(finished_group, 6) # 60%
+        # --- END FIX ---
+        
         layout.addLayout(tables_layout) # Add tables layout
         # --- END FIX ---
 
