@@ -538,6 +538,10 @@ class ScraperWorker(QThread):
             concurrency = self.args.batch_size
             queue = asyncio.Queue(maxsize=concurrency * 2)
             
+            # --- MODIFIED: Get db_path to pass to workers ---
+            db_path = self.args.db_file
+            # --- END MODIFIED ---
+            
             # Create worker tasks
             for i in range(concurrency):
                 worker_id = f"Worker-{i+1}" 
@@ -546,7 +550,8 @@ class ScraperWorker(QThread):
                     self.active_tasks_dict, self.active_tasks_lock,
                     self.onion_only_mode, self.titles_only_mode,
                     self.keywords, self.save_page_data_mode, # <-- Pass mode string
-                    self.top_level_only_mode 
+                    self.top_level_only_mode,
+                    db_path  # <-- MODIFIED: Pass db_path
                 ))
                 self.worker_tasks.append(task)
             
