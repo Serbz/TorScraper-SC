@@ -113,11 +113,11 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
     page_text = soup.get_text(separator=' ', strip=True)
     matching_keyword = None
 
-    # --- MODIFIED: Handle REGEX: prefix and store matched text ---
+    # --- MODIFIED: Handle "Assert" vs "Find" regex types ---
     if keywords:
             try:
                 page_text_lower = page_text.lower()
-                # Pad the whole document with spaces for reliable whole-word matching
+                # Pad the whole document for reliable whole-word matching
                 page_text_padded = f" {page_text_lower} " 
                 
                 unique_matches_found = set()
@@ -129,18 +129,30 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
                             # Get the regex pattern (remove "REGEX: ")
                             pattern = keyword[7:].strip()
                             
-                            # Use re.finditer to find ALL matches of this pattern
-                            for match in re.finditer(pattern, page_text, re.IGNORECASE):
-                                # Get the actual matched text (e.g., " street ")
-                                matched_text = match.group(0) 
-                                
-                                # Strip it (e.g., "street")
-                                stripped_match = matched_text.strip()
-                                
-                                # Add the *result* to the set, not the pattern
-                                if stripped_match: # Don't add empty strings
-                                    unique_matches_found.add(stripped_match)
-                                    logging.info(f"[KEYWORD HIT] Regex '{pattern}' found: '{stripped_match}' at {base_url}")
+                            # --- NEW CRASH FIX ---
+                            # Check if this is a "whole document" Assert pattern
+                            if pattern.startswith("(?="):
+                                # If so, use re.search() ONCE.
+                                # This is fast and checks for a single match anywhere.
+                                if re.search(pattern, page_text, re.IGNORECASE):
+                                    # We can't know *what* it matched (lookaheads don't capture),
+                                    # so we save the pattern itself.
+                                    unique_matches_found.add(keyword) # Add the full "REGEX: ..." string
+                                    logging.info(f"[KEYWORD HIT] Whole-document regex '{pattern}' matched at {base_url}")
+                            else:
+                                # This is a normal "Find" regex. Use finditer.
+                                for match in re.finditer(pattern, page_text, re.IGNORECASE):
+                                    # Get the actual matched text (e.g., " street ")
+                                    matched_text = match.group(0) 
+                                    
+                                    # Strip it (e.g., "street")
+                                    stripped_match = matched_text.strip()
+                                    
+                                    # Add the *result* to the set
+                                    if stripped_match: # Don't add empty strings
+                                        unique_matches_found.add(stripped_match)
+                                        logging.info(f"[KEYWORD HIT] Regex '{pattern}' found: '{stripped_match}' at {base_url}")
+                            # --- END CRASH FIX ---
 
                         except re.error as e:
                             logging.warning(f"Invalid regex in keyword file: '{keyword}'. Error: {e}")
@@ -176,8 +188,6 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
         absolute_link = urljoin(base_url, href).rstrip('/')
         
         # --- FIX: Add junk filter ---
-        # Note: This is redundant if database.py is also filtering,
-        # but provides defense-in-depth.
         if is_junk_url(absolute_link):
             continue
         # --- END FIX ---
