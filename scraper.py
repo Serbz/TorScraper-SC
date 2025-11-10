@@ -31,6 +31,14 @@ NON_HTML_EXTENSIONS = {
     '.iso', '.dmg', '.tar', '.gz', '.7z', '.xml', '.rss'
 }
 
+# --- NEW: Helper coroutine to wait for the threading.Event ---
+async def wait_for_stop_event(stop_event):
+    """Polls a threading.Event in an async-friendly way."""
+    while not stop_event.is_set():
+        await asyncio.sleep(0.1)
+    logging.warning("Stop event detected during queue join.")
+# --- END NEW ---
+
 async def get_data(url, task_id, worker_id, active_tasks_dict, active_tasks_lock): # <-- Added worker_id
     """Asynchronously fetches the content of a URL using a random proxy."""
     chosen_proxy = random.choice(PROXIES)
@@ -105,7 +113,7 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
     page_text = soup.get_text(separator=' ', strip=True)
     matching_keyword = None
 
-    # --- FIX (Request 1): Handle REGEX: prefix ---
+    # --- MODIFIED: Handle REGEX: prefix and store matched text ---
     if keywords:
             try:
                 page_text_lower = page_text.lower()
@@ -120,15 +128,25 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
                         try:
                             # Get the regex pattern (remove "REGEX: ")
                             pattern = keyword[7:].strip()
-                            # Run re.search on the *original* case-sensitive text
-                            if re.search(pattern, page_text, re.IGNORECASE): 
-                                unique_matches_found.add(keyword) # Add the full "REGEX: ..." string
-                                logging.info(f"[KEYWORD HIT] Regex '{pattern}' matched at {base_url}")
+                            
+                            # Use re.finditer to find ALL matches of this pattern
+                            for match in re.finditer(pattern, page_text, re.IGNORECASE):
+                                # Get the actual matched text (e.g., " street ")
+                                matched_text = match.group(0) 
+                                
+                                # Strip it (e.g., "street")
+                                stripped_match = matched_text.strip()
+                                
+                                # Add the *result* to the set, not the pattern
+                                if stripped_match: # Don't add empty strings
+                                    unique_matches_found.add(stripped_match)
+                                    logging.info(f"[KEYWORD HIT] Regex '{pattern}' found: '{stripped_match}' at {base_url}")
+
                         except re.error as e:
                             logging.warning(f"Invalid regex in keyword file: '{keyword}'. Error: {e}")
                     
                     else:
-                        # This is a plain text keyword
+                        # This is a plain text keyword (logic is unchanged)
                         keyword_lower = keyword.lower()
                         
                         if ' ' in keyword_lower:
@@ -150,7 +168,7 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
 
             except Exception as e:
                 logging.error(f"Error during keyword search at {base_url}: {e}")
-    # --- END FIX ---
+    # --- END MODIFIED ---
 
     found_links = set()
     for link in soup.find_all('a', href=True):
@@ -184,162 +202,178 @@ async def scraper_worker_task(worker_id, queue, stop_event, pause_event,
                             active_tasks_dict, active_tasks_lock, 
                             onion_only_mode, titles_only_mode, 
                             keywords, save_page_data_mode, # <-- Changed
-                            top_level_only_mode):
+                            top_level_only_mode,
+                            db_path): # <-- MODIFIED: Add db_path
     """
-    A worker (consumer) that pulls a (db, url, task_id) tuple from the 
+    A worker (consumer) that pulls a (url, task_id) tuple from the 
     queue and processes it.
     """
-    while not stop_event.is_set():
-        # --- FIX: Status defaults to 2 (fail) ---
-        status = 2 # Assume fail
-        # --- END FIX ---
-        
-        # --- FIX: Need url and db handle in finally block ---
-        url = None
-        db = None
-        task_id = None
-        # --- END FIX ---
-        
-        # --- FIX: Define variables for DB update ---
-        new_links = []
-        title_to_save = "Scrape Failed"
-        keyword_match_to_save = None
-        page_data_to_save = None
-        # --- END FIX ---
-            
-        try:
-            # --- 1. Check for Pause Event ---
-            if pause_event.is_set():
-                logging.info(f"[{worker_id}] Paused...")
-                while pause_event.is_set():
-                    if stop_event.is_set(): break
-                    await asyncio.sleep(0.5)
-                if stop_event.is_set(): break
-                logging.info(f"[{worker_id}] Resuming...")
+    
+    # --- MODIFIED: Worker creates its own DB connection ---
+    db = DatabaseManager(db_path)
+    # --- END MODIFIED ---
 
-            # --- 2. Get Work from Queue ---
-            try:
-                # Wait 1 second for an item, then re-check stop/pause
-                db, url, task_id = await asyncio.wait_for(queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue # Loop back to check stop/pause
+    try: # --- MODIFIED: Wrap entire loop in try...finally ---
+        while not stop_event.is_set():
+            # --- FIX: Status defaults to 2 (fail) ---
+            status = 2 # Assume fail
+            # --- END FIX ---
             
+            # --- FIX: Need url and db handle in finally block ---
+            url = None
+            # db = None # <-- REMOVED: db is now local to worker
+            task_id = None
+            # --- END FIX ---
             
+            # --- FIX: Define variables for DB update ---
+            new_links = []
+            title_to_save = "Scrape Failed"
+            keyword_match_to_save = None
+            page_data_to_save = None
+            # --- END FIX ---
+                
             try:
-                # --- 3. Process the URL ---
-                result = await get_data(url, task_id, worker_id, active_tasks_dict, active_tasks_lock)
+                # --- 1. Check for Pause Event ---
+                if pause_event.is_set():
+                    logging.info(f"[{worker_id}] Paused...")
+                    while pause_event.is_set():
+                        if stop_event.is_set(): break
+                        await asyncio.sleep(0.5)
+                    if stop_event.is_set(): break
+                    logging.info(f"[{worker_id}] Resuming...")
+
+                # --- 2. Get Work from Queue ---
+                try:
+                    # Wait 1 second for an item, then re-check stop/pause
+                    # --- MODIFIED: No longer get 'db' from queue ---
+                    url, task_id = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue # Loop back to check stop/pause
                 
-                if stop_event.is_set():
-                    logging.warning(f"[{worker_id}] Stop requested. Discarding result for {url}. DB not updated.")
-                    continue 
-                    
-                # --- This block is now only for SUCCESSFUL fetches ---
-                if isinstance(result, bytes): # Fetch success
-                    try:
-                        # Decode content
-                        html_content = result.decode('utf-8', errors='ignore')
-                        
-                        # Parse content
-                        new_links, title, page_text, matching_keyword = parse_page_content(
-                            html_content, url, onion_only_mode, titles_only_mode, keywords
-                        )
-                        
-                        logging.info(f"[{worker_id}] Parsed Title: '{title}' from {url}")
-                        
-                        title_to_save = title
-                        keyword_match_to_save = matching_keyword
-                        
-                        # --- FIX (Request 2): Update title in active dict ---
-                        with active_tasks_lock:
-                            if task_id in active_tasks_dict:
-                                active_tasks_dict[task_id]['title'] = title_to_save
-                        # --- END FIX ---
-                        
-                        # --- Updated Save Page Data Logic ---
-                        if save_page_data_mode == "All":
-                            page_data_to_save = page_text 
-                        elif save_page_data_mode == "Keyword Match" and matching_keyword:
-                            page_data_to_save = page_text
-                        # If mode is "None", page_data_to_save remains None
-                        # --- End Updated Logic ---
-                        
-                        # --- BUG FIX: titles_only_mode must also set status=1 ---
-                        if titles_only_mode:
-                            # db.update_titles_batch([(title_to_save, url)]) # <-- OLD
-                            status = 1 # Mark as success
-                            # We still `continue` to skip the main DB logic
-                            # The 'finally' block will now handle the DB update
-                        else:
-                            status = 1 # Full scrape success
-                        # --- END BUG FIX ---
-                    
-                    except Exception as e:
-                        logging.error(f"[{worker_id}] Error parsing content from {url}: {e}")
-                        # status remains 2, title remains "Scrape Failed"
                 
-                # Note: If result is None (e.g., 404), status remains 2
-                # and title_to_save remains "Scrape Failed", which is correct.
+                try:
+                    # --- 3. Process the URL ---
+                    result = await get_data(url, task_id, worker_id, active_tasks_dict, active_tasks_lock)
+                    
+                    if stop_event.is_set():
+                        logging.warning(f"[{worker_id}] Stop requested. Discarding result for {url}. DB not updated.")
+                        continue 
+                        
+                    # --- This block is now only for SUCCESSFUL fetches ---
+                    if isinstance(result, bytes): # Fetch success
+                        try:
+                            # Decode content
+                            html_content = result.decode('utf-8', errors='ignore')
+                            
+                            # Parse content
+                            new_links, title, page_text, matching_keyword = parse_page_content(
+                                html_content, url, onion_only_mode, titles_only_mode, keywords
+                            )
+                            
+                            logging.info(f"[{worker_id}] Parsed Title: '{title}' from {url}")
+                            
+                            title_to_save = title
+                            keyword_match_to_save = matching_keyword
+                            
+                            # --- FIX (Request 2): Update title in active dict ---
+                            with active_tasks_lock:
+                                if task_id in active_tasks_dict:
+                                    active_tasks_dict[task_id]['title'] = title_to_save
+                            # --- END FIX ---
+                            
+                            # --- Updated Save Page Data Logic ---
+                            if save_page_data_mode == "All":
+                                page_data_to_save = page_text 
+                            elif save_page_data_mode == "Keyword Match" and matching_keyword:
+                                page_data_to_save = page_text
+                            # If mode is "None", page_data_to_save remains None
+                            # --- End Updated Logic ---
+                            
+                            # --- BUG FIX: titles_only_mode must also set status=1 ---
+                            if titles_only_mode:
+                                # db.update_titles_batch([(title_to_save, url)]) # <-- OLD
+                                status = 1 # Mark as success
+                                # We still `continue` to skip the main DB logic
+                                # The 'finally' block will now handle the DB update
+                            else:
+                                status = 1 # Full scrape success
+                            # --- END BUG FIX ---
+                        
+                        except Exception as e:
+                            logging.error(f"[{worker_id}] Error parsing content from {url}: {e}")
+                            # status remains 2, title remains "Scrape Failed"
+                    
+                    # Note: If result is None (e.g., 404), status remains 2
+                    # and title_to_save remains "Scrape Failed", which is correct.
+
+                except asyncio.CancelledError:
+                    logging.info(f"[{worker_id}] Task for {url} was cancelled.")
+                    # Re-raise to be caught by outer loop and exit
+                    raise
+                except Exception as e:
+                    # --- FIX: Log common network errors to DEBUG (file only) ---
+                    # Check if the exception is a common, expected network error.
+                    # We want to log these to the file (DEBUG) but not flood the GUI (ERROR).
+                    if isinstance(e, (ProxyError, CurlError)):
+                        # Log at DEBUG level: file_handler will see this, gui_handler will NOT.
+                        logging.debug(f"[{worker_id}] Network error for {url}: {e}\n{traceback.format_exc()}")
+                    else:
+                        # This is an unexpected error (e.g., parsing, logic), log it to the GUI.
+                        logging.error(f"[{worker_id}] Error in worker processing {url}: {e}\n{traceback.format_exc()}")
+                    # --- END FIX ---
+                    
+                    # Status is already 2 (fail), title is "Scrape Failed"
+                    # We will now fall through to the finally block to update the DB
+                finally:
+                    # --- 5. Signal Task Completion & DB Update ---
+                    
+                    # Don't update DB if stop was requested
+                    if stop_event.is_set():
+                        logging.warning(f"[{worker_id}] Stop requested. Final DB update for {url} skipped.")
+                    # --- FIX: This block now correctly handles all cases ---
+                    else:
+                        try:
+                            # --- MODIFIED: 'db' is local, 'url' check is sufficient ---
+                            if url: 
+                                
+                                # --- BUG FIX: titles_only_mode now updates status ---
+                                if titles_only_mode:
+                                    # This now correctly updates status AND title
+                                    db.update_status_and_title_batch([(status, title_to_save, url)])
+                                # --- END BUG FIX ---
+                                
+                                else:
+                                    # This is the main update for full-scrape mode (success or fail)
+                                    db.update_links_batch([(status, title_to_save, keyword_match_to_save, page_data_to_save, url)])
+                                
+                                # Add new links (only happens on status=1 and not titles_only)
+                                if status == 1 and new_links and not titles_only_mode:
+                                    db.add_links(new_links, add_top_level_too=top_level_only_mode)
+                                    
+                        except Exception as e:
+                            logging.error(f"[{worker_id}] CRITICAL: Failed to update DB for {url}: {e}")
+                    # --- END FIX ---
+
+                    with active_tasks_lock:
+                        if task_id in active_tasks_dict:
+                            active_tasks_dict[task_id]['status'] = status
+                    
+                    # --- MODIFIED: Check db variable before task_done ---
+                    if db:
+                        queue.task_done()
 
             except asyncio.CancelledError:
-                logging.info(f"[{worker_id}] Task for {url} was cancelled.")
-                # Re-raise to be caught by outer loop and exit
-                raise
+                logging.info(f"[{worker_id}] Worker shutting down.")
+                break # Exit the main while loop
             except Exception as e:
-                # --- FIX: Log common network errors to DEBUG (file only) ---
-                # Check if the exception is a common, expected network error.
-                # We want to log these to the file (DEBUG) but not flood the GUI (ERROR).
-                if isinstance(e, (ProxyError, CurlError)):
-                    # Log at DEBUG level: file_handler will see this, gui_handler will NOT.
-                    logging.debug(f"[{worker_id}] Network error for {url}: {e}\n{traceback.format_exc()}")
-                else:
-                    # This is an unexpected error (e.g., parsing, logic), log it to the GUI.
-                    logging.error(f"[{worker_id}] Error in worker processing {url}: {e}\n{traceback.format_exc()}")
-                # --- END FIX ---
+                logging.error(f"[{worker_id}] Critical worker error: {e}")
+                await asyncio.sleep(0.1)
                 
-                # Status is already 2 (fail), title is "Scrape Failed"
-                # We will now fall through to the finally block to update the DB
-            finally:
-                # --- 5. Signal Task Completion & DB Update ---
-                
-                # Don't update DB if stop was requested
-                if stop_event.is_set():
-                    logging.warning(f"[{worker_id}] Stop requested. Final DB update for {url} skipped.")
-                # --- FIX: This block now correctly handles all cases ---
-                else:
-                    try:
-                        if db and url: # Ensure we have a DB and URL to update
-                            
-                            # --- BUG FIX: titles_only_mode now updates status ---
-                            if titles_only_mode:
-                                # This now correctly updates status AND title
-                                db.update_status_and_title_batch([(status, title_to_save, url)])
-                            # --- END BUG FIX ---
-                            
-                            else:
-                                # This is the main update for full-scrape mode (success or fail)
-                                db.update_links_batch([(status, title_to_save, keyword_match_to_save, page_data_to_save, url)])
-                            
-                            # Add new links (only happens on status=1 and not titles_only)
-                            if status == 1 and new_links and not titles_only_mode:
-                                db.add_links(new_links, add_top_level_too=top_level_only_mode)
-                                
-                    except Exception as e:
-                        logging.error(f"[{worker_id}] CRITICAL: Failed to update DB for {url}: {e}")
-                # --- END FIX ---
-
-                with active_tasks_lock:
-                    if task_id in active_tasks_dict:
-                        active_tasks_dict[task_id]['status'] = status
-                
-                if db: # db might be None if queue.get() times out
-                    queue.task_done()
-
-        except asyncio.CancelledError:
-            logging.info(f"[{worker_id}] Worker shutting down.")
-            break # Exit the main while loop
-        except Exception as e:
-            logging.error(f"[{worker_id}] Critical worker error: {e}")
-            await asyncio.sleep(0.1) 
+    # --- MODIFIED: Add outer finally block ---
+    finally:
+        db.close() # Worker closes its own connection
+        logging.debug(f"[{worker_id}] DB connection closed.")
+    # --- END MODIFIED ---
 
 
 async def scraper_main_producer(queue, args, stop_event, 
@@ -402,7 +436,8 @@ async def scraper_main_producer(queue, args, stop_event,
                         # --- REVAMP: Use non-blocking queue.put ---
                         while not stop_event.is_set():
                             try:
-                                queue.put_nowait((db, url, task_id))
+                                # --- MODIFIED: Don't pass 'db' ---
+                                queue.put_nowait((url, task_id))
                                 processed_in_this_run.add(url)
                                 break # Put successful, move to next url
                             except asyncio.QueueFull:
@@ -433,7 +468,8 @@ async def scraper_main_producer(queue, args, stop_event,
                         # --- REVAMP: Use non-blocking queue.put ---
                         while not stop_event.is_set():
                             try:
-                                queue.put_nowait((db, url, task_id))
+                                # --- MODIFIED: Don't pass 'db' ---
+                                queue.put_nowait((url, task_id))
                                 processed_in_this_run.add(url)
                                 break # Put successful, move to next url
                             except asyncio.QueueFull:
@@ -498,7 +534,8 @@ async def scraper_main_producer(queue, args, stop_event,
                     # --- REVAMP: Use non-blocking queue.put ---
                     while not stop_event.is_set():
                         try:
-                            queue.put_nowait((db, url, task_id))
+                            # --- MODIFIED: Don't pass 'db' ---
+                            queue.put_nowait((url, task_id))
                             processed_in_this_run.add(url)
                             break # Put successful, move to next url
                         except asyncio.QueueFull:
@@ -507,19 +544,30 @@ async def scraper_main_producer(queue, args, stop_event,
                 
                 if stop_event.is_set(): break
 
-                # --- FIX: Replaced await queue.join() with a polling loop ---
-                # This allows the producer to check the stop_event frequently
-                # instead of blocking until the entire queue is drained.
-                logging.info(f"--- Iteration {iteration_count} links queued. Waiting for queue to drain... ---")
-                while not queue.empty():
-                    if stop_event.is_set():
-                        logging.warning("Stop detected during queue drain. Breaking producer loop.")
-                        break
-                    await asyncio.sleep(1) # Poll every second
+                # --- MODIFIED: Robust, non-blocking queue.join() wait ---
+                logging.info(f"--- Iteration {iteration_count} links queued. Waiting for all tasks to complete... ---")
                 
-                if stop_event.is_set(): break
-                # await queue.join() # <-- REMOVED BLOCKING CALL
-                # --- END FIX ---
+                # Create the two tasks we'll wait for
+                join_task = asyncio.create_task(queue.join())
+                stop_task = asyncio.create_task(wait_for_stop_event(stop_event))
+
+                # Wait for *either* the queue to be joined OR the stop event to be set
+                done, pending = await asyncio.wait(
+                    {join_task, stop_task}, 
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                # We must cancel the task that didn't finish
+                for task in pending:
+                    task.cancel()
+
+                # Now, check *why* we woke up
+                if stop_task in done or stop_event.is_set():
+                    logging.warning("Stop detected during queue join. Breaking producer loop.")
+                    break # This breaks the outer 'while not stop_event.is_set()' loop
+
+                # If we're here, it means join_task finished and stop_task didn't.
+                # --- END MODIFIED ---
 
                 logging.info(f"--- Iteration {iteration_count} queue drained. Checking for new links. ---")
                 
