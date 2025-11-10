@@ -103,7 +103,7 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     # --- END FIX ---
-
+    #
     # --- FIX for OpenType font warnings ---
     # This tells Qt to not log font database warnings.
     os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.text.font.db=false"
