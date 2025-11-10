@@ -182,25 +182,41 @@ class DatabaseManager:
         """
         if not keywords: return 0 
 
-        keyword_regex_parts = []
-        keyword_regex_values = []
-        
-        for keyword in keywords:
-            escaped_keyword = re.escape(keyword)
-            keyword_regex_parts.append("keyword_match REGEXP ?")
-            pattern = r'(^|,\s*)' + escaped_keyword + r'(\s*,|$)'
-            keyword_regex_values.append(pattern)
+        # --- MODIFIED: This logic must match the filter function ---
+        input_keywords_plain = {k.strip().lower() for k in keywords if not k.startswith("REGEX: ")}
+        input_keywords_regex = []
+        for k in keywords:
+            if k.startswith("REGEX: "):
+                try:
+                    pattern = k[7:].strip()
+                    input_keywords_regex.append((k, re.compile(pattern, re.IGNORECASE)))
+                except re.error:
+                    pass # Ignore invalid regex
 
-        if not keyword_regex_parts:
+        sql_query_parts = []
+        sql_query_values = []
+        
+        # 1. Add plain keywords
+        for k in input_keywords_plain:
+            sql_query_parts.append("keyword_match REGEXP ?")
+            sql_query_values.append(r'(^|,\s*)' + re.escape(k) + r'(\s*,|$)')
+            
+        # 2. Add ALL regex keywords (searches by *executing* the pattern)
+        for original_string, pattern in input_keywords_regex:
+            sql_query_parts.append("keyword_match REGEXP ?")
+            sql_query_values.append(pattern.pattern) 
+        # --- END MODIFIED LOGIC ---
+
+        if not sql_query_parts:
             return 0
             
-        sql_filter = " OR ".join(keyword_regex_parts)
+        sql_filter = " OR ".join(sql_query_parts)
         count_query = f"SELECT COUNT(*) FROM links WHERE keyword_match IS NOT NULL AND keyword_match != '' AND ({sql_filter})"
         
         with self.conn:
             self.conn.row_factory = None # Ensure default
             self.conn.create_function("REGEXP", 2, sqlite_regexp) 
-            cursor = self.conn.execute(count_query, keyword_regex_values)
+            cursor = self.conn.execute(count_query, sql_query_values)
             return cursor.fetchone()[0]
 
     def filter_links_by_keyword_threshold_to_new_db(self, new_db_path, keywords, threshold, progress_signal=None, total_rows_to_check=-1): 
@@ -211,26 +227,46 @@ class DatabaseManager:
         if not keywords:
             return 0 
 
+        # --- MODIFIED: Separate all 3 keyword types for counting ---
         input_keywords_plain = {k.strip().lower() for k in keywords if not k.startswith("REGEX: ")}
-        input_keywords_regex = []
+        
+        input_assert_regex = [] # Holds ("REGEX: (?=...)", re.compile(...))
+        input_find_regex = []   # Holds ("REGEX: \s...", re.compile(...))
+        
         for k in keywords:
             if k.startswith("REGEX: "):
                 try:
-                    pattern = k[7:].strip()
-                    input_keywords_regex.append((k, re.compile(pattern, re.IGNORECASE)))
+                    pattern_str = k[7:].strip()
+                    compiled_pattern = re.compile(pattern_str, re.IGNORECASE)
+                    
+                    if pattern_str.startswith("(?="):
+                        input_assert_regex.append((k, compiled_pattern))
+                    else:
+                        input_find_regex.append((k, compiled_pattern))
+                        
                 except re.error as e:
                     logging.warning(f"Invalid regex in keyword file (skipping): '{k}'. Error: {e}")
+        # --- END MODIFIED ---
 
+        # --- MODIFIED: Build SQL query to find all candidates ---
         sql_query_parts = []
         sql_query_values = []
         
+        # 1. Add plain keywords (searches for the literal word)
         for k in input_keywords_plain:
             sql_query_parts.append("keyword_match REGEXP ?")
+            # This regex looks for "word" at the start, end, or surrounded by ", "
             sql_query_values.append(r'(^|,\s*)' + re.escape(k) + r'(\s*,|$)')
             
-        for original_string, pattern in input_keywords_regex:
+        # 2. Add ALL regex keywords (checks by *executing* the pattern)
+        for original_string, pattern in input_assert_regex:
             sql_query_parts.append("keyword_match REGEXP ?")
-            sql_query_values.append(r'(^|,\s*)' + re.escape(original_string) + r'(\s*,|$)')
+            sql_query_values.append(pattern.pattern) # Pass raw pattern
+            
+        for original_string, pattern in input_find_regex:
+            sql_query_parts.append("keyword_match REGEXP ?")
+            sql_query_values.append(pattern.pattern) # Pass raw pattern
+        # --- END MODIFIED ---
         
         if not sql_query_parts:
             logging.warning("No valid keywords found for filtering.")
@@ -291,16 +327,37 @@ class DatabaseManager:
                 row_tuple = tuple(row[col] for col in columns_to_insert)
                 keyword_match_string = row['keyword_match']
                 
+                # --- MODIFIED: New counting logic ---
                 unique_match_count = 0
                 if keyword_match_string:
-                    stored_matches_set = {k.strip().lower() for k in keyword_match_string.split(',')}
-                    common_plain_matches = stored_matches_set.intersection(input_keywords_plain)
+                    # Stored keywords can be: "market", "street", "REGEX: (?=...)"
+                    stored_matches_set_lower = {k.strip().lower() for k in keyword_match_string.split(',')}
+                    stored_matches_original_case = {k.strip() for k in keyword_match_string.split(',')}
+
+                    # 1. Count plain keyword matches
+                    common_plain_matches = stored_matches_set_lower.intersection(input_keywords_plain)
                     unique_match_count += len(common_plain_matches)
-                    stored_regex_matches = {k.strip() for k in keyword_match_string.split(',') if k.strip().startswith("REGEX: ")}
                     
-                    for input_regex_str, _ in input_keywords_regex:
-                        if input_regex_str in stored_regex_matches:
+                    # 2. Count "Assert" regex matches
+                    # Check if any of the stored items are the "Assert" regex patterns
+                    for input_regex_str, _ in input_assert_regex:
+                        if input_regex_str in stored_matches_original_case: # Must use original case
                             unique_match_count += 1
+                                
+                    # 3. Count "Find" regex matches
+                    # Check if any "Find" regex *pattern* matches any *stored word*
+                    stored_words_only = {k for k in stored_matches_original_case if not k.startswith("REGEX: ")}
+                    
+                    if stored_words_only:
+                        for _, find_pattern in input_find_regex:
+                            # Check if this pattern matches *any* of the stored words
+                            for word in stored_words_only:
+                                if find_pattern.search(word):
+                                    unique_match_count += 1
+                                    # This pattern is matched, break to avoid double-counting
+                                    # (e.g., if "street" and "house" both match \s\w{5}\s)
+                                    break 
+                # --- END MODIFIED COUNTING ---
                 
                 rows_processed += 1
                 if progress_signal and total_rows_to_check > 0 and rows_processed % 20 == 0: 
