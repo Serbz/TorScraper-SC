@@ -173,8 +173,10 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
                             logging.info(f"[KEYWORD HIT] Found '{keyword}' at {base_url}")
                 
                 if unique_matches_found:
-                    # Store keywords alphabetically for consistency
-                    matching_keyword = ", ".join(sorted(list(unique_matches_found)))
+                    # --- THIS IS THE FIX ---
+                    # Use the new unique delimiter
+                    matching_keyword = " _!|!_ ".join(sorted(list(unique_matches_found)))
+                    # --- END FIX ---
                 else:
                     matching_keyword = None
 
