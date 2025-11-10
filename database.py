@@ -182,30 +182,43 @@ class DatabaseManager:
         """
         if not keywords: return 0 
 
-        # --- MODIFIED: This logic must match the filter function ---
+        # --- MODIFIED: Separate all 3 keyword types ---
         input_keywords_plain = {k.strip().lower() for k in keywords if not k.startswith("REGEX: ")}
-        input_keywords_regex = []
+        input_assert_regex = []
+        input_find_regex = []
+
         for k in keywords:
             if k.startswith("REGEX: "):
                 try:
-                    pattern = k[7:].strip()
-                    input_keywords_regex.append((k, re.compile(pattern, re.IGNORECASE)))
+                    pattern_str = k[7:].strip()
+                    compiled_pattern = re.compile(pattern_str, re.IGNORECASE)
+                    if pattern_str.startswith("(?="):
+                        input_assert_regex.append((k, compiled_pattern))
+                    else:
+                        input_find_regex.append((k, compiled_pattern))
                 except re.error:
                     pass # Ignore invalid regex
+        # --- END MODIFIED ---
 
         sql_query_parts = []
         sql_query_values = []
         
-        # 1. Add plain keywords
+        # --- MODIFIED: Use LIKE for "Plain" and "Assert" ---
+        # 1. Add plain keywords (searches for the literal word)
         for k in input_keywords_plain:
-            sql_query_parts.append("keyword_match REGEXP ?")
-            sql_query_values.append(r'(^|,\s*)' + re.escape(k) + r'(\s*,|$)')
+            sql_query_parts.append("keyword_match LIKE ?")
+            sql_query_values.append(f"%{k}%") # Use LIKE
             
-        # 2. Add ALL regex keywords (searches by *executing* the pattern)
-        for original_string, pattern in input_keywords_regex:
+        # 2. Add "Assert" regex (searches for the literal "REGEX: (?=...)" string)
+        for original_string, pattern in input_assert_regex:
+            sql_query_parts.append("keyword_match LIKE ?")
+            sql_query_values.append(f"%{original_string}%") # Use LIKE
+            
+        # 3. Add "Find" regex (executes the pattern against the stored words)
+        for original_string, pattern in input_find_regex:
             sql_query_parts.append("keyword_match REGEXP ?")
-            sql_query_values.append(pattern.pattern) 
-        # --- END MODIFIED LOGIC ---
+            sql_query_values.append(pattern.pattern) # Use REGEXP
+        # --- END MODIFIED ---
 
         if not sql_query_parts:
             return 0
@@ -252,20 +265,21 @@ class DatabaseManager:
         sql_query_parts = []
         sql_query_values = []
         
+        # --- MODIFIED: Use LIKE for "Plain" and "Assert" ---
         # 1. Add plain keywords (searches for the literal word)
         for k in input_keywords_plain:
-            sql_query_parts.append("keyword_match REGEXP ?")
-            # This regex looks for "word" at the start, end, or surrounded by ", "
-            sql_query_values.append(r'(^|,\s*)' + re.escape(k) + r'(\s*,|$)')
+            sql_query_parts.append("keyword_match LIKE ?")
+            sql_query_values.append(f"%{k}%") # Use LIKE
             
-        # 2. Add ALL regex keywords (checks by *executing* the pattern)
+        # 2. Add "Assert" regex (searches for the literal "REGEX: (?=...)" string)
         for original_string, pattern in input_assert_regex:
-            sql_query_parts.append("keyword_match REGEXP ?")
-            sql_query_values.append(pattern.pattern) # Pass raw pattern
+            sql_query_parts.append("keyword_match LIKE ?")
+            sql_query_values.append(f"%{original_string}%") # Use LIKE
             
+        # 3. Add "Find" regex (executes the pattern against the stored words)
         for original_string, pattern in input_find_regex:
             sql_query_parts.append("keyword_match REGEXP ?")
-            sql_query_values.append(pattern.pattern) # Pass raw pattern
+            sql_query_values.append(pattern.pattern) # Use REGEXP
         # --- END MODIFIED ---
         
         if not sql_query_parts:
@@ -291,6 +305,7 @@ class DatabaseManager:
                 cursor = temp_conn.execute(f"SELECT COUNT(*) FROM links WHERE keyword_match IS NOT NULL AND keyword_match != '' AND ({sql_filter})", sql_query_values)
                 total_rows_to_check = cursor.fetchone()[0]
                 temp_conn.close()
+                logging.info(f"Calculated {total_rows_to_check} candidate rows for keyword pull.")
             except Exception as e:
                 logging.error(f"Failed to get keyword match count: {e}")
                 total_rows_to_check = 0
@@ -309,6 +324,8 @@ class DatabaseManager:
             temp_conn.create_function("REGEXP", 2, sqlite_regexp)
             cursor = temp_conn.cursor()
             
+            logging.debug(f"Executing keyword pull query: {initial_query}")
+            logging.debug(f"With values: {sql_query_values}")
             cursor.execute(initial_query, sql_query_values)
             
             original_columns = [description[0] for description in cursor.description]
@@ -330,9 +347,11 @@ class DatabaseManager:
                 # --- MODIFIED: New counting logic ---
                 unique_match_count = 0
                 if keyword_match_string:
-                    # Stored keywords can be: "market", "street", "REGEX: (?=...)"
-                    stored_matches_set_lower = {k.strip().lower() for k in keyword_match_string.split(',')}
-                    stored_matches_original_case = {k.strip() for k in keyword_match_string.split(',')}
+                    # --- THIS IS THE FIX ---
+                    # Split by the new unique delimiter
+                    stored_matches_set_lower = {k.strip().lower() for k in keyword_match_string.split(" _!|!_ ")}
+                    stored_matches_original_case = {k.strip() for k in keyword_match_string.split(" _!|!_ ")}
+                    # --- END FIX ---
 
                     # 1. Count plain keyword matches
                     common_plain_matches = stored_matches_set_lower.intersection(input_keywords_plain)
@@ -352,7 +371,8 @@ class DatabaseManager:
                         for _, find_pattern in input_find_regex:
                             # Check if this pattern matches *any* of the stored words
                             for word in stored_words_only:
-                                if find_pattern.search(word):
+                                # --- THIS IS THE FIX: Use re.search, not re.fullmatch ---
+                                if find_pattern.search(word): 
                                     unique_match_count += 1
                                     # This pattern is matched, break to avoid double-counting
                                     # (e.g., if "street" and "house" both match \s\w{5}\s)
@@ -497,11 +517,11 @@ class DatabaseManager:
 
             with new_conn:
                 # --- FIX: Create table with correct schema ---
-                schema_string = self._build_create_table_schema(COLUMNS_TO_INSERT)
+                schema_string = self._build_create_table_schema(columns_to_insert)
                 new_conn.execute(f"CREATE TABLE links ({schema_string})")
                 # --- END FIX ---
                 
-                placeholders = ", ".join(["?"] * len(COLUMNS_TO_INSERT))
+                placeholders = ", ".join(["?"] * len(columns_to_insert))
                 insert_sql = f"INSERT OR IGNORE INTO links ({', '.join(COLUMNS_TO_INSERT)}) VALUES ({placeholders})"
 
             for row in cursor:
