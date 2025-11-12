@@ -15,7 +15,7 @@ import json
 import logging
 import sqlite3
 import binascii
-import re # <-- Already imported
+import re2 as re # <-- MODIFIED: Using re2
 import shutil
 import importlib.util # <-- ADDED for robust package checking
 from datetime import datetime
