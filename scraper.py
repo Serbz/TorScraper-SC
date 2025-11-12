@@ -8,7 +8,7 @@ import asyncio
 import traceback
 import time 
 import warnings
-import re # <-- Import re at top level
+import re2 as re # <-- MODIFIED: Using re2
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
@@ -84,15 +84,10 @@ async def get_data(url, task_id, worker_id, active_tasks_dict, active_tasks_lock
         # --- END FIX ---
         raise # Re-raise the exception to be handled by the worker
     
-    finally:
-        with active_tasks_lock:
-            if task_id in active_tasks_dict:
-                # Mark as finished instead of deleting
-                active_tasks_dict[task_id]['finished_at'] = time.time()
-                # --- FIX (Request 2): Set failed title ---
-                if active_tasks_dict[task_id]['title'] == "Pending...":
-                     active_tasks_dict[task_id]['title'] = "Scrape Failed"
-                # --- END FIX ---
+    # --- FIX: REMOVED FINALLY BLOCK ---
+    # The 'finally' block that set 'finished_at' and 'Scrape Failed'
+    # title has been removed to fix the race condition.
+    # This is now handled by the main worker task.
     
     return None 
 
@@ -134,14 +129,14 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
                             if pattern.startswith("(?="):
                                 # If so, use re.search() ONCE.
                                 # This is fast and checks for a single match anywhere.
-                                if re.search(pattern, page_text, re.IGNORECASE):
+                                if re.search(pattern, page_text, re.IGNORECASE): # <-- USE 're'
                                     # We can't know *what* it matched (lookaheads don't capture),
                                     # so we save the pattern itself.
                                     unique_matches_found.add(keyword) # Add the full "REGEX: ..." string
                                     logging.info(f"[KEYWORD HIT] Whole-document regex '{pattern}' matched at {base_url}")
                             else:
                                 # This is a normal "Find" regex. Use finditer.
-                                for match in re.finditer(pattern, page_text, re.IGNORECASE):
+                                for match in re.finditer(pattern, page_text, re.IGNORECASE): # <-- USE 're'
                                     # Get the actual matched text (e.g., " street ")
                                     matched_text = match.group(0) 
                                     
@@ -154,7 +149,7 @@ def parse_page_content(html_content, base_url, onion_only_mode=False, titles_onl
                                         logging.info(f"[KEYWORD HIT] Regex '{pattern}' found: '{stripped_match}' at {base_url}")
                             # --- END CRASH FIX ---
 
-                        except re.error as e:
+                        except re.error as e: # <-- MODIFIED to re.error
                             logging.warning(f"Invalid regex in keyword file: '{keyword}'. Error: {e}")
                     
                     else:
@@ -273,15 +268,21 @@ async def scraper_worker_task(worker_id, queue, stop_event, pause_event,
                         
                     # --- This block is now only for SUCCESSFUL fetches ---
                     if isinstance(result, bytes): # Fetch success
+                        # --- NEW: VERBOSE LOGGING (DEBUG) ---
+                        logging.debug(f"[{worker_id}] Download complete for {url}. Attempting to parse {len(result)} bytes...")
+                        # --- END NEW ---
                         try:
                             # Decode content
+                            logging.debug(f"[{worker_id}] Decoding content for {url}...") # <-- NEW
                             html_content = result.decode('utf-8', errors='ignore')
+                            logging.debug(f"[{worker_id}] Content decoded. HTML length: {len(html_content)}. Parsing...") # <-- NEW
                             
                             # Parse content
                             new_links, title, page_text, matching_keyword = parse_page_content(
                                 html_content, url, onion_only_mode, titles_only_mode, keywords
                             )
                             
+                            logging.debug(f"[{worker_id}] Content parsed for {url}.") # <-- NEW
                             logging.info(f"[{worker_id}] Parsed Title: '{title}' from {url}")
                             
                             title_to_save = title
@@ -310,13 +311,21 @@ async def scraper_worker_task(worker_id, queue, stop_event, pause_event,
                             else:
                                 status = 1 # Full scrape success
                             # --- END BUG FIX ---
+                            
+                            logging.debug(f"[{worker_id}] Successfully processed {url}. Setting status=1.") # <-- NEW
                         
                         except Exception as e:
-                            logging.error(f"[{worker_id}] Error parsing content from {url}: {e}")
+                            # --- NEW: VERBOSE LOGGING (ERROR) ---
+                            logging.error(f"[{worker_id}] CRITICAL PARSE FAILURE for {url}. Bytes downloaded: {len(result)}. Error: {e}")
+                            logging.error(f"[{worker_id}] Full traceback for parse failure:\n{traceback.format_exc()}")
+                            # --- END NEW ---
                             # status remains 2, title remains "Scrape Failed"
                     
-                    # Note: If result is None (e.g., 404), status remains 2
-                    # and title_to_save remains "Scrape Failed", which is correct.
+                    # --- NEW: VERBOSE LOGGING (DEBUG) ---
+                    else:
+                        # This logs if get_data returned None (e.g., 404)
+                        logging.debug(f"[{worker_id}] No bytes returned from get_data for {url}. Status remains 2.")
+                    # --- END NEW ---
 
                 except asyncio.CancelledError:
                     logging.info(f"[{worker_id}] Task for {url} was cancelled.")
@@ -368,7 +377,14 @@ async def scraper_worker_task(worker_id, queue, stop_event, pause_event,
 
                     with active_tasks_lock:
                         if task_id in active_tasks_dict:
+                            # --- THIS IS THE FIX ---
+                            # Set the final status AND the finish time
                             active_tasks_dict[task_id]['status'] = status
+                            active_tasks_dict[task_id]['finished_at'] = time.time()
+                            # If scraping failed, ensure title is "Scrape Failed"
+                            if status == 2 and active_tasks_dict[task_id]['title'] == "Pending...":
+                                active_tasks_dict[task_id]['title'] = "Scrape Failed"
+                            # --- END FIX ---
                     
                     # --- MODIFIED: Check db variable before task_done ---
                     if db:
