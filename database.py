@@ -5,7 +5,7 @@ Contains the DatabaseManager class for handling all SQLite operations.
 import sqlite3
 import logging
 from utils import get_top_level_url, is_junk_url
-import re 
+import re2 as re # <-- MODIFIED: Using re2
 import os
 import shutil
 import traceback
@@ -21,7 +21,7 @@ def sqlite_regexp(expression, item):
     try:
         # Use re imported at the top of the module
         return re.search(expression, item, re.IGNORECASE) is not None
-    except re.error:
+    except re.error: # <-- MODIFIED to re.error
         # If the regex is invalid, return False
         return False
 # --- END NEW ---
@@ -196,7 +196,7 @@ class DatabaseManager:
                         input_assert_regex.append((k, compiled_pattern))
                     else:
                         input_find_regex.append((k, compiled_pattern))
-                except re.error:
+                except re.error: # <-- MODIFIED to re.error
                     pass # Ignore invalid regex
         # --- END MODIFIED ---
 
@@ -257,7 +257,7 @@ class DatabaseManager:
                     else:
                         input_find_regex.append((k, compiled_pattern))
                         
-                except re.error as e:
+                except re.error as e: # <-- MODIFIED to re.error
                     logging.warning(f"Invalid regex in keyword file (skipping): '{k}'. Error: {e}")
         # --- END MODIFIED ---
 
