@@ -42,6 +42,7 @@ def run_installers():
         ('scapy', 'scapy'),
         ('pyuac', 'pyuac'),
         ('requests', 'requests'),
+        ('re2', 're2'), # <-- ADDED: Google's RE2 for fast, safe regex
     ]
     
     restart_needed = False
