@@ -517,11 +517,13 @@ class DatabaseManager:
 
             with new_conn:
                 # --- FIX: Create table with correct schema ---
-                schema_string = self._build_create_table_schema(columns_to_insert)
+                # FIX 1: Use correct variable name for schema generation
+                schema_string = self._build_create_table_schema(COLUMNS_TO_INSERT) 
                 new_conn.execute(f"CREATE TABLE links ({schema_string})")
                 # --- END FIX ---
                 
-                placeholders = ", ".join(["?"] * len(columns_to_insert))
+                # FIX 2: Use correct variable name for placeholders
+                placeholders = ", ".join(["?"] * len(COLUMNS_TO_INSERT))
                 insert_sql = f"INSERT OR IGNORE INTO links ({', '.join(COLUMNS_TO_INSERT)}) VALUES ({placeholders})"
 
             for row in cursor:
@@ -540,7 +542,6 @@ class DatabaseManager:
                     with new_conn:
                         new_conn.executemany(insert_sql, insert_batch)
                     inserted_count += len(insert_batch)
-                    insert_batch = []
             
             if insert_batch:
                 with new_conn:
