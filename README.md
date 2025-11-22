@@ -98,7 +98,7 @@ Access the **DB Actions** menu for utility functions:
 
 ## Important Notes
 
-* **Keyword Matching**: The matching logic is case-insensitive. For single words (e.g., `bitcoin`), the scraper enforces **whole-word matching** (i.e., it won't match `bitcoiner`). For multi-word phrases, it searches for the phrase as-is. IT IS INCREDIBLY IMPORTANT TO NOTE: THAT YOU CAN PREFIX A LINE IN YOUR KEYWORD FILE WITH 'REGEX: ' AND USE REGULAR EXPRESSION TO MATCH YOUR KEYWORDS. (Your line would look like this "REGEX: \w+\d+")
+* **Keyword Matching**: For single words (e.g., `bitcoin`), the scraper enforces **whole-word matching** (i.e., it won't match `bitcoiner`). For multi-word phrases, it searches for the phrase as-is. IT IS INCREDIBLY IMPORTANT TO NOTE: that you can prefix a line in the keyword search file with 'REGEX: ' and use regular expression to match your keywords. (Your line would look like this "REGEX: \w+\d+")
 
 * **Database Viewer**: The built-in `DbViewer` is a low-memory, **paginated** tool designed for viewing large result sets. It also includes right-click options to **Copy** cell/row data, **Set NULL**, or **Delete** rows.
 
