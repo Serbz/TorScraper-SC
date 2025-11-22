@@ -203,21 +203,23 @@ class DatabaseManager:
         sql_query_parts = []
         sql_query_values = []
         
-        # --- MODIFIED: Use LIKE for "Plain" and "Assert" ---
+        # --- MODIFIED: Force Case-Insensitive SQL ---
         # 1. Add plain keywords (searches for the literal word)
         for k in input_keywords_plain:
-            sql_query_parts.append("keyword_match LIKE ?")
-            sql_query_values.append(f"%{k}%") # Use LIKE
+            # Use LOWER(col) to guarantee case insensitivity in SQL
+            sql_query_parts.append("LOWER(keyword_match) LIKE ?")
+            sql_query_values.append(f"%{k}%") 
             
         # 2. Add "Assert" regex (searches for the literal "REGEX: (?=...)" string)
         for original_string, pattern in input_assert_regex:
-            sql_query_parts.append("keyword_match LIKE ?")
-            sql_query_values.append(f"%{original_string}%") # Use LIKE
+            sql_query_parts.append("LOWER(keyword_match) LIKE ?")
+            # Lowercase the search term because we are lowercasing the column
+            sql_query_values.append(f"%{original_string.lower()}%") 
             
         # 3. Add "Find" regex (executes the pattern against the stored words)
         for original_string, pattern in input_find_regex:
             sql_query_parts.append("keyword_match REGEXP ?")
-            sql_query_values.append(pattern.pattern) # Use REGEXP
+            sql_query_values.append(pattern.pattern) # Use REGEXP (uses re.IGNORECASE)
         # --- END MODIFIED ---
 
         if not sql_query_parts:
@@ -265,21 +267,21 @@ class DatabaseManager:
         sql_query_parts = []
         sql_query_values = []
         
-        # --- MODIFIED: Use LIKE for "Plain" and "Assert" ---
+        # --- MODIFIED: Force Case-Insensitive SQL ---
         # 1. Add plain keywords (searches for the literal word)
         for k in input_keywords_plain:
-            sql_query_parts.append("keyword_match LIKE ?")
-            sql_query_values.append(f"%{k}%") # Use LIKE
+            sql_query_parts.append("LOWER(keyword_match) LIKE ?")
+            sql_query_values.append(f"%{k}%") 
             
         # 2. Add "Assert" regex (searches for the literal "REGEX: (?=...)" string)
         for original_string, pattern in input_assert_regex:
-            sql_query_parts.append("keyword_match LIKE ?")
-            sql_query_values.append(f"%{original_string}%") # Use LIKE
+            sql_query_parts.append("LOWER(keyword_match) LIKE ?")
+            sql_query_values.append(f"%{original_string.lower()}%") 
             
         # 3. Add "Find" regex (executes the pattern against the stored words)
         for original_string, pattern in input_find_regex:
             sql_query_parts.append("keyword_match REGEXP ?")
-            sql_query_values.append(pattern.pattern) # Use REGEXP
+            sql_query_values.append(pattern.pattern) # Use REGEXP (uses re.IGNORECASE)
         # --- END MODIFIED ---
         
         if not sql_query_parts:
@@ -517,12 +519,10 @@ class DatabaseManager:
 
             with new_conn:
                 # --- FIX: Create table with correct schema ---
-                # FIX 1: Use correct variable name for schema generation
-                schema_string = self._build_create_table_schema(COLUMNS_TO_INSERT) 
+                schema_string = self._build_create_table_schema(COLUMNS_TO_INSERT)
                 new_conn.execute(f"CREATE TABLE links ({schema_string})")
                 # --- END FIX ---
                 
-                # FIX 2: Use correct variable name for placeholders
                 placeholders = ", ".join(["?"] * len(COLUMNS_TO_INSERT))
                 insert_sql = f"INSERT OR IGNORE INTO links ({', '.join(COLUMNS_TO_INSERT)}) VALUES ({placeholders})"
 
